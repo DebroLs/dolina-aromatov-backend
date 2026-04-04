@@ -12,6 +12,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const MAX_AUTH_AGE_SECONDS = 60 * 60 * 24;
 
+type Weather = "Солнце" | "Туман" | "Дождь";
+type TimeOfDay = "Утро" | "День" | "Вечер";
+type InventoryKind = "ingredient" | "fish" | "aroma" | "resource" | "misc";
+type AlchemyStage = "idle" | "brewing" | "finalizing" | "success" | "failed";
+
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN is missing in .env");
 }
@@ -172,6 +177,34 @@ function getSingleParam(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function isWeather(value: unknown): value is Weather {
+  return value === "Солнце" || value === "Туман" || value === "Дождь";
+}
+
+function isTimeOfDay(value: unknown): value is TimeOfDay {
+  return value === "Утро" || value === "День" || value === "Вечер";
+}
+
+function isInventoryKind(value: unknown): value is InventoryKind {
+  return (
+    value === "ingredient" ||
+    value === "fish" ||
+    value === "aroma" ||
+    value === "resource" ||
+    value === "misc"
+  );
+}
+
+function isAlchemyStage(value: unknown): value is AlchemyStage {
+  return (
+    value === "idle" ||
+    value === "brewing" ||
+    value === "finalizing" ||
+    value === "success" ||
+    value === "failed"
+  );
+}
+
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
 
@@ -189,23 +222,12 @@ function sanitizeProgress(progress: unknown) {
   const inventory = inventoryRaw
     .slice(0, 200)
     .filter(isRecord)
-    .map((item) => {
-      const kind =
-        item.kind === "ingredient" ||
-        item.kind === "fish" ||
-        item.kind === "aroma" ||
-        item.kind === "resource" ||
-        item.kind === "misc"
-          ? item.kind
-          : "misc";
-
-      return {
-        id: toSafeString(item.id, ""),
-        name: toSafeString(item.name, ""),
-        kind,
-        count: toSafeNumber(item.count, 0, 0, 9999)
-      };
-    })
+    .map((item) => ({
+      id: toSafeString(item.id, ""),
+      name: toSafeString(item.name, ""),
+      kind: isInventoryKind(item.kind) ? item.kind : "misc",
+      count: toSafeNumber(item.count, 0, 0, 9999)
+    }))
     .filter((item) => item.id && item.name);
 
   const tasks = tasksRaw
@@ -216,7 +238,6 @@ function sanitizeProgress(progress: unknown) {
       title: toSafeString(task.title, ""),
       description: toSafeString(task.description, ""),
       rewardCoins: toSafeNumber(task.rewardCoins, 0, 0, 999999),
-      rewardDust: toSafeNumber(task.rewardDust, 0, 0, 999999),
       done: toSafeBoolean(task.done)
     }))
     .filter((task) => task.id && task.title);
@@ -239,27 +260,18 @@ function sanitizeProgress(progress: unknown) {
     .filter((value): value is string => typeof value === "string")
     .slice(0, 3);
 
+  const alchemyStage = isAlchemyStage(alchemyRaw.stage)
+    ? alchemyRaw.stage
+    : "idle";
+
   return {
     player: {
       name: toSafeString(playerRaw.name, "Путешественник"),
-      coins: toSafeNumber(playerRaw.coins, 120, 0, 999999),
-      aromaDust: toSafeNumber(playerRaw.aromaDust, 4, 0, 999999),
-      energy: toSafeNumber(playerRaw.energy, 8, 0, 999),
-      maxEnergy: toSafeNumber(playerRaw.maxEnergy, 10, 1, 999)
+      coins: toSafeNumber(playerRaw.coins, 120, 0, 999999)
     },
     world: {
-      weather:
-        worldRaw.weather === "Солнце" ||
-        worldRaw.weather === "Туман" ||
-        worldRaw.weather === "Дождь"
-          ? worldRaw.weather
-          : "Солнце",
-      timeOfDay:
-        worldRaw.timeOfDay === "Утро" ||
-        worldRaw.timeOfDay === "День" ||
-        worldRaw.timeOfDay === "Вечер"
-          ? worldRaw.timeOfDay
-          : "Утро"
+      weather: isWeather(worldRaw.weather) ? worldRaw.weather : "Солнце",
+      timeOfDay: isTimeOfDay(worldRaw.timeOfDay) ? worldRaw.timeOfDay : "Утро"
     },
     village: {
       visited: {
@@ -276,7 +288,11 @@ function sanitizeProgress(progress: unknown) {
     locations,
     alchemy: {
       heat: toSafeNumber(alchemyRaw.heat, 50, 0, 100),
-      selectedIngredients
+      selectedIngredients,
+      stage: alchemyStage,
+      brewProgress: toSafeNumber(alchemyRaw.brewProgress, 0, 0, 100),
+      finalProgress: toSafeNumber(alchemyRaw.finalProgress, 0, 0, 100),
+      lastResultName: toNullableString(alchemyRaw.lastResultName)
     },
     fishing: {
       casts: toSafeNumber(fishingRaw.casts, 0, 0, 999999),
@@ -292,16 +308,20 @@ function buildProgressSummary(progress: unknown) {
 
   return {
     coins: safe.player.coins,
-    aromaDust: safe.player.aromaDust,
-    energy: safe.player.energy,
-    maxEnergy: safe.player.maxEnergy,
     tasksDone: safe.tasks.filter((task) => task.done).length,
     tasksTotal: safe.tasks.length,
     inventoryItems: safe.inventory.length,
     inventoryCount: safe.inventory.reduce((sum, item) => sum + item.count, 0),
+    aromasCount: safe.inventory
+      .filter((item) => item.kind === "aroma")
+      .reduce((sum, item) => sum + item.count, 0),
     openedLocations: safe.locations.filter((location) => location.status === "Открыто").length,
     firstFish: safe.village.caughtFirstFish,
     firstAroma: safe.village.brewedFirstAroma,
+    alchemyStage: safe.alchemy.stage,
+    brewProgress: safe.alchemy.brewProgress,
+    finalProgress: safe.alchemy.finalProgress,
+    lastAromaName: safe.alchemy.lastResultName,
     casts: safe.fishing.casts,
     catches: safe.fishing.catches,
     perfectCatches: safe.fishing.perfectCatches,
