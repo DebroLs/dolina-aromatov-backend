@@ -9,6 +9,7 @@ const prisma = new PrismaClient();
 
 const PORT = Number(process.env.PORT || 3001);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const MAX_AUTH_AGE_SECONDS = 60 * 60 * 24;
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -146,10 +147,6 @@ function toSafeString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-function toNullableString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
 function toSafeBoolean(value: unknown): boolean {
   return value === true;
 }
@@ -275,6 +272,66 @@ function sanitizeProgress(progress: unknown) {
   };
 }
 
+function buildProgressSummary(progress: unknown) {
+  const safe = sanitizeProgress(progress);
+
+  return {
+    coins: safe.player.coins,
+    aromaDust: safe.player.aromaDust,
+    energy: safe.player.energy,
+    maxEnergy: safe.player.maxEnergy,
+    tasksDone: safe.tasks.filter((task) => task.done).length,
+    tasksTotal: safe.tasks.length,
+    inventoryItems: safe.inventory.length,
+    inventoryCount: safe.inventory.reduce((sum, item) => sum + item.count, 0),
+    openedLocations: safe.locations.filter((location) => location.status === "Открыто").length,
+    firstFish: safe.village.caughtFirstFish,
+    firstAroma: safe.village.brewedFirstAroma
+  };
+}
+
+function getAdminSecretFromRequest(req: Request): string {
+  const headerSecret = req.headers["x-admin-secret"];
+  const querySecret = req.query.secret;
+
+  if (typeof headerSecret === "string" && headerSecret.trim()) {
+    return headerSecret;
+  }
+
+  if (typeof querySecret === "string" && querySecret.trim()) {
+    return querySecret;
+  }
+
+  return "";
+}
+function getSingleParam(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) {
+    return value[0] ?? "";
+  }
+
+  return typeof value === "string" ? value : "";
+}
+
+function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
+  if (!ADMIN_SECRET) {
+    return res.status(500).json({
+      ok: false,
+      error: "ADMIN_SECRET is missing on server"
+    });
+  }
+
+  const incomingSecret = getAdminSecretFromRequest(req);
+
+  if (!incomingSecret || incomingSecret !== ADMIN_SECRET) {
+    return res.status(403).json({
+      ok: false,
+      error: "Forbidden"
+    });
+  }
+
+  next();
+}
+
 async function findOrCreateTelegramUser(initData: string): Promise<DbUser> {
   const { telegramUser } = parseAndValidateTelegramInitData(initData);
 
@@ -393,6 +450,121 @@ app.post("/api/progress", requireTelegramAuth, async (req, res, next) => {
     next(error);
   }
 });
+
+app.get("/api/admin/users", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: {
+        updatedAt: "desc"
+      }
+    });
+
+    res.json({
+      ok: true,
+      total: users.length,
+      users: users.map((user) => ({
+        id: user.id,
+        telegramId: user.telegramId.toString(),
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        languageCode: user.languageCode,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        summary: buildProgressSummary(user.progress ?? {})
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/users/:id", requireAdminSecret, async (req, res, next) => {
+  try {
+    const userId = getSingleParam(req.params.id);
+
+    if (!userId) {
+      return res.status(400).json({
+        ok: false,
+        error: "User id is missing"
+      });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: {
+        id: userId
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        error: "User not found"
+      });
+    }
+
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        telegramId: user.telegramId.toString(),
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        languageCode: user.languageCode,
+        photoUrl: user.photoUrl,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        summary: buildProgressSummary(user.progress ?? {})
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get(
+  "/api/admin/users/:id/progress",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: {
+          id: userId
+        }
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found"
+        });
+      }
+
+      res.json({
+        ok: true,
+        user: {
+          id: user.id,
+          telegramId: user.telegramId.toString(),
+          username: user.username,
+          firstName: user.firstName
+        },
+        progress: sanitizeProgress(user.progress ?? {})
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
