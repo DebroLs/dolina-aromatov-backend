@@ -39,10 +39,6 @@ type DbUser = {
   languageCode: string | null;
   photoUrl: string | null;
   progress: Prisma.JsonValue | null;
-  visitCount: number;
-  progressSaveCount: number;
-  lastSeenAt: Date | null;
-  lastProgressSaveAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -144,13 +140,7 @@ function serializeUser(user: DbUser) {
     firstName: user.firstName,
     lastName: user.lastName,
     languageCode: user.languageCode,
-    photoUrl: user.photoUrl,
-    visitCount: user.visitCount,
-    progressSaveCount: user.progressSaveCount,
-    lastSeenAt: user.lastSeenAt,
-    lastProgressSaveAt: user.lastProgressSaveAt,
-    createdAt: user.createdAt,
-    updatedAt: user.updatedAt
+    photoUrl: user.photoUrl
   };
 }
 
@@ -265,7 +255,8 @@ function sanitizeProgress(progress: unknown) {
 
   const selectedIngredients = (Array.isArray(alchemyRaw.selectedIngredients)
     ? alchemyRaw.selectedIngredients
-    : [])
+    : []
+  )
     .filter((value): value is string => typeof value === "string")
     .slice(0, 3);
 
@@ -327,9 +318,9 @@ function buildProgressSummary(progress: unknown) {
     aromasCount: safe.inventory
       .filter((item) => item.kind === "aroma")
       .reduce((sum, item) => sum + item.count, 0),
-    openedLocations: safe.locations.filter((location) => location.status === "Открыто")
-      .length,
-    visitedPaths: safe.village.visited.paths,
+    openedLocations: safe.locations.filter(
+      (location) => location.status === "Открыто"
+    ).length,
     firstFish: safe.village.caughtFirstFish,
     firstAroma: safe.village.brewedFirstAroma,
     alchemyStage: safe.alchemy.stage,
@@ -399,41 +390,11 @@ async function findOrCreateTelegramUser(initData: string): Promise<DbUser> {
       lastName: telegramUser.last_name ?? null,
       languageCode: telegramUser.language_code ?? null,
       photoUrl: telegramUser.photo_url ?? null,
-      progress: {},
-      visitCount: 0,
-      progressSaveCount: 0,
-      lastSeenAt: null,
-      lastProgressSaveAt: null
+      progress: {}
     }
   });
 
   return dbUser;
-}
-
-async function touchUserVisit(userId: string) {
-  return prisma.user.update({
-    where: { id: userId },
-    data: {
-      visitCount: {
-        increment: 1
-      },
-      lastSeenAt: new Date()
-    }
-  });
-}
-
-async function saveUserProgress(userId: string, progress: Prisma.InputJsonValue) {
-  return prisma.user.update({
-    where: { id: userId },
-    data: {
-      progress,
-      progressSaveCount: {
-        increment: 1
-      },
-      lastSeenAt: new Date(),
-      lastProgressSaveAt: new Date()
-    }
-  });
 }
 
 async function requireTelegramAuth(
@@ -494,18 +455,13 @@ app.get("/api/me", requireTelegramAuth, (req, res) => {
   });
 });
 
-app.get("/api/progress", requireTelegramAuth, async (req, res, next) => {
-  try {
-    const authReq = req as AuthenticatedRequest;
-    await touchUserVisit(authReq.dbUser!.id);
+app.get("/api/progress", requireTelegramAuth, (req, res) => {
+  const authReq = req as AuthenticatedRequest;
 
-    res.json({
-      ok: true,
-      progress: sanitizeProgress(authReq.dbUser?.progress ?? {})
-    });
-  } catch (error) {
-    next(error);
-  }
+  res.json({
+    ok: true,
+    progress: sanitizeProgress(authReq.dbUser?.progress ?? {})
+  });
 });
 
 app.post("/api/progress", requireTelegramAuth, async (req, res, next) => {
@@ -514,7 +470,14 @@ app.post("/api/progress", requireTelegramAuth, async (req, res, next) => {
     const cleanProgress = sanitizeProgress(req.body?.progress ?? {});
     const progress = toJsonValue(cleanProgress);
 
-    const updatedUser = await saveUserProgress(authReq.dbUser!.id, progress);
+    const updatedUser = await prisma.user.update({
+      where: {
+        id: authReq.dbUser!.id
+      },
+      data: {
+        progress
+      }
+    });
 
     res.json({
       ok: true,
@@ -543,11 +506,6 @@ app.get("/api/admin/users", requireAdminSecret, async (_req, res, next) => {
         firstName: user.firstName,
         lastName: user.lastName,
         languageCode: user.languageCode,
-        photoUrl: user.photoUrl,
-        visitCount: user.visitCount,
-        progressSaveCount: user.progressSaveCount,
-        lastSeenAt: user.lastSeenAt,
-        lastProgressSaveAt: user.lastProgressSaveAt,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         summary: buildProgressSummary(user.progress ?? {})
@@ -592,10 +550,6 @@ app.get("/api/admin/users/:id", requireAdminSecret, async (req, res, next) => {
         lastName: user.lastName,
         languageCode: user.languageCode,
         photoUrl: user.photoUrl,
-        visitCount: user.visitCount,
-        progressSaveCount: user.progressSaveCount,
-        lastSeenAt: user.lastSeenAt,
-        lastProgressSaveAt: user.lastProgressSaveAt,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         summary: buildProgressSummary(user.progress ?? {})
@@ -639,11 +593,7 @@ app.get(
           id: user.id,
           telegramId: user.telegramId.toString(),
           username: user.username,
-          firstName: user.firstName,
-          visitCount: user.visitCount,
-          progressSaveCount: user.progressSaveCount,
-          lastSeenAt: user.lastSeenAt,
-          lastProgressSaveAt: user.lastProgressSaveAt
+          firstName: user.firstName
         },
         progress: sanitizeProgress(user.progress ?? {})
       });
