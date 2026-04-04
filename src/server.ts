@@ -147,6 +147,10 @@ function toSafeString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function toNullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
 function toSafeBoolean(value: unknown): boolean {
   return value === true;
 }
@@ -164,6 +168,10 @@ function toSafeNumber(
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
+function getSingleParam(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
 
@@ -172,6 +180,7 @@ function sanitizeProgress(progress: unknown) {
   const villageRaw = isRecord(root.village) ? root.village : {};
   const visitedRaw = isRecord(villageRaw.visited) ? villageRaw.visited : {};
   const alchemyRaw = isRecord(root.alchemy) ? root.alchemy : {};
+  const fishingRaw = isRecord(root.fishing) ? root.fishing : {};
 
   const inventoryRaw = Array.isArray(root.inventory) ? root.inventory : [];
   const tasksRaw = Array.isArray(root.tasks) ? root.tasks : [];
@@ -268,6 +277,12 @@ function sanitizeProgress(progress: unknown) {
     alchemy: {
       heat: toSafeNumber(alchemyRaw.heat, 50, 0, 100),
       selectedIngredients
+    },
+    fishing: {
+      casts: toSafeNumber(fishingRaw.casts, 0, 0, 999999),
+      catches: toSafeNumber(fishingRaw.catches, 0, 0, 999999),
+      perfectCatches: toSafeNumber(fishingRaw.perfectCatches, 0, 0, 999999),
+      lastCatchName: toNullableString(fishingRaw.lastCatchName)
     }
   };
 }
@@ -286,7 +301,11 @@ function buildProgressSummary(progress: unknown) {
     inventoryCount: safe.inventory.reduce((sum, item) => sum + item.count, 0),
     openedLocations: safe.locations.filter((location) => location.status === "Открыто").length,
     firstFish: safe.village.caughtFirstFish,
-    firstAroma: safe.village.brewedFirstAroma
+    firstAroma: safe.village.brewedFirstAroma,
+    casts: safe.fishing.casts,
+    catches: safe.fishing.catches,
+    perfectCatches: safe.fishing.perfectCatches,
+    lastCatchName: safe.fishing.lastCatchName
   };
 }
 
@@ -303,13 +322,6 @@ function getAdminSecretFromRequest(req: Request): string {
   }
 
   return "";
-}
-function getSingleParam(value: string | string[] | undefined): string {
-  if (Array.isArray(value)) {
-    return value[0] ?? "";
-  }
-
-  return typeof value === "string" ? value : "";
 }
 
 function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
