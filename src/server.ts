@@ -876,6 +876,111 @@ app.post(
   }
 );
 
+
+app.post(
+  "/api/admin/users/:id/locations",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const locationId = toSafeString(req.body?.locationId, "").trim();
+      const action = toSafeString(req.body?.action, "").trim();
+
+      if (!locationId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Location id is missing"
+        });
+      }
+
+      if (action !== "open" && action !== "close") {
+        return res.status(400).json({
+          ok: false,
+          error: "Unknown location action"
+        });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: {
+          id: userId
+        }
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found"
+        });
+      }
+
+      const safeProgress = sanitizeProgress(user.progress ?? {});
+      const locationIndex = safeProgress.locations.findIndex(
+        (location) => location.id === locationId
+      );
+
+      if (locationIndex === -1) {
+        return res.status(404).json({
+          ok: false,
+          error: "Location not found"
+        });
+      }
+
+      const previousLocation = {
+        ...safeProgress.locations[locationIndex]
+      };
+      const nextLocation = {
+        ...safeProgress.locations[locationIndex],
+        status: action === "open" ? "Открыто" : "Закрыто"
+      };
+
+      safeProgress.locations[locationIndex] = nextLocation;
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: userId
+        },
+        data: {
+          progress: toJsonValue(safeProgress)
+        }
+      });
+
+      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
+      const summary = buildProgressSummary(updatedUser.progress ?? {});
+
+      res.json({
+        ok: true,
+        user: {
+          id: updatedUser.id,
+          telegramId: updatedUser.telegramId.toString(),
+          username: updatedUser.username,
+          firstName: updatedUser.firstName,
+          lastName: updatedUser.lastName,
+          updatedAt: updatedUser.updatedAt
+        },
+        progress: cleanProgress,
+        summary,
+        adminAction: {
+          type: "location",
+          locationId,
+          action,
+          previousLocation,
+          nextLocation
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const message =
