@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 import cors from "cors";
 import crypto from "crypto";
@@ -11,6 +12,7 @@ const PORT = Number(process.env.PORT || 3001);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const MAX_AUTH_AGE_SECONDS = 60 * 60 * 24;
+const SYSTEM_TELEGRAM_ID = BigInt(0);
 
 type Weather = "Солнце" | "Туман" | "Дождь";
 type TimeOfDay = "Утро" | "День" | "Вечер";
@@ -24,6 +26,12 @@ type InventoryKind =
   | "story";
 type AlchemyStage = "idle" | "brewing" | "finalizing" | "success" | "failed";
 type TaskCategory = "story" | "daily" | "secret";
+
+type GlobalWorldSettings = {
+  weather: Weather;
+  timeOfDay: TimeOfDay;
+  eventName: string;
+};
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN is missing in .env");
@@ -54,6 +62,13 @@ type DbUser = {
 type AuthenticatedRequest = Request & {
   dbUser?: DbUser;
 };
+
+class BannedError extends Error {
+  constructor() {
+    super("Player is banned");
+    this.name = "BannedError";
+  }
+}
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -219,6 +234,26 @@ function isTaskCategory(value: unknown): value is TaskCategory {
   return value === "story" || value === "daily" || value === "secret";
 }
 
+function clampInteger(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function parseAdminNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+
+    if (Number.isFinite(parsed)) {
+      return Math.floor(parsed);
+    }
+  }
+
+  return null;
+}
+
 function sanitizeInventoryItem(item: unknown) {
   const safeItem = isRecord(item) ? item : {};
 
@@ -227,6 +262,16 @@ function sanitizeInventoryItem(item: unknown) {
     name: toSafeString(safeItem.name, ""),
     kind: isInventoryKind(safeItem.kind) ? safeItem.kind : "misc",
     count: toSafeNumber(safeItem.count, 0, 0, 9999)
+  };
+}
+
+function sanitizeGlobalWorldSettings(value: unknown): GlobalWorldSettings {
+  const safeValue = isRecord(value) ? value : {};
+
+  return {
+    weather: isWeather(safeValue.weather) ? safeValue.weather : "Солнце",
+    timeOfDay: isTimeOfDay(safeValue.timeOfDay) ? safeValue.timeOfDay : "Утро",
+    eventName: toSafeString(safeValue.eventName, "").slice(0, 100)
   };
 }
 
@@ -240,6 +285,7 @@ function sanitizeProgress(progress: unknown) {
   const storyRaw = isRecord(root.story) ? root.story : {};
   const alchemyRaw = isRecord(root.alchemy) ? root.alchemy : {};
   const fishingRaw = isRecord(root.fishing) ? root.fishing : {};
+  const adminRaw = isRecord(root.admin) ? root.admin : {};
 
   const inventoryRaw = Array.isArray(root.inventory) ? root.inventory : [];
   const tasksRaw = Array.isArray(root.tasks) ? root.tasks : [];
@@ -251,7 +297,7 @@ function sanitizeProgress(progress: unknown) {
     .filter((item) => item.id && item.name);
 
   const tasks = tasksRaw
-    .slice(0, 50)
+    .slice(0, 100)
     .filter(isRecord)
     .map((task) => {
       const rewardItemsRaw = Array.isArray(task.rewardItems) ? task.rewardItems : [];
@@ -306,7 +352,8 @@ function sanitizeProgress(progress: unknown) {
     },
     world: {
       weather: isWeather(worldRaw.weather) ? worldRaw.weather : "Солнце",
-      timeOfDay: isTimeOfDay(worldRaw.timeOfDay) ? worldRaw.timeOfDay : "Утро"
+      timeOfDay: isTimeOfDay(worldRaw.timeOfDay) ? worldRaw.timeOfDay : "Утро",
+      eventName: toSafeString(worldRaw.eventName, "").slice(0, 100)
     },
     village: {
       visited: {
@@ -345,14 +392,71 @@ function sanitizeProgress(progress: unknown) {
       catches: toSafeNumber(fishingRaw.catches, 0, 0, 999999),
       perfectCatches: toSafeNumber(fishingRaw.perfectCatches, 0, 0, 999999),
       lastCatchName: toNullableString(fishingRaw.lastCatchName)
+    },
+    admin: {
+      banned: toSafeBoolean(adminRaw.banned)
     }
   };
+}
+
+function buildEffectiveProgress(progress: unknown, globalWorld: GlobalWorldSettings) {
+  const safe = sanitizeProgress(progress);
+
+  return {
+    ...safe,
+    world: {
+      ...safe.world,
+      weather: globalWorld.weather,
+      timeOfDay: globalWorld.timeOfDay,
+      eventName: globalWorld.eventName
+    }
+  };
+}
+
+function getLevelFromSummary(summary: {
+  tasksDone: number;
+  tasksClaimed: number;
+  catches: number;
+  perfectCatches: number;
+  aromasCount: number;
+  inventoryItems: number;
+}) {
+  const storyUnits =
+    summary.tasksClaimed * 4 + Math.max(0, summary.tasksDone - summary.tasksClaimed);
+  const activityUnits = Math.min(
+    5,
+    Math.floor(
+      (summary.catches +
+        summary.perfectCatches +
+        summary.aromasCount +
+        summary.inventoryItems) /
+        8
+    )
+  );
+
+  return clampInteger(1 + Math.floor((storyUnits + activityUnits) / 5), 1, 20);
+}
+
+function getActLabelByLevel(level: number) {
+  if (level <= 5) {
+    return "I акт";
+  }
+
+  if (level <= 10) {
+    return "II акт";
+  }
+
+  if (level <= 15) {
+    return "III акт";
+  }
+
+  return "IV акт";
 }
 
 function buildProgressSummary(progress: unknown) {
   const safe = sanitizeProgress(progress);
 
-  return {
+  const baseSummary = {
     coins: safe.player.coins,
     tasksDone: safe.tasks.filter((task) => task.done).length,
     tasksClaimed: safe.tasks.filter((task) => task.claimed).length,
@@ -374,7 +478,24 @@ function buildProgressSummary(progress: unknown) {
     casts: safe.fishing.casts,
     catches: safe.fishing.catches,
     perfectCatches: safe.fishing.perfectCatches,
-    lastCatchName: safe.fishing.lastCatchName
+    lastCatchName: safe.fishing.lastCatchName,
+    banned: safe.admin.banned
+  };
+
+  const level = getLevelFromSummary(baseSummary);
+  const progressPercent = baseSummary.tasksTotal
+    ? clampInteger(
+        Math.round((baseSummary.tasksDone / baseSummary.tasksTotal) * 100),
+        0,
+        100
+      )
+    : 0;
+
+  return {
+    ...baseSummary,
+    progressPercent,
+    level,
+    actLabel: getActLabelByLevel(level)
   };
 }
 
@@ -413,26 +534,59 @@ function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-
-
-function clampInteger(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, Math.floor(value)));
+function isBannedProgress(progress: unknown) {
+  return sanitizeProgress(progress).admin.banned;
 }
 
-function parseAdminNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.floor(value);
-  }
-
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-
-    if (Number.isFinite(parsed)) {
-      return Math.floor(parsed);
+async function getOrCreateSystemUser() {
+  return prisma.user.upsert({
+    where: {
+      telegramId: SYSTEM_TELEGRAM_ID
+    },
+    update: {},
+    create: {
+      telegramId: SYSTEM_TELEGRAM_ID,
+      username: "__system__",
+      firstName: "__system__",
+      lastName: null,
+      languageCode: null,
+      photoUrl: null,
+      progress: {
+        globalWorld: {
+          weather: "Солнце",
+          timeOfDay: "Утро",
+          eventName: ""
+        }
+      }
     }
-  }
+  });
+}
 
-  return null;
+async function getGlobalWorldSettings() {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+  return sanitizeGlobalWorldSettings(root.globalWorld);
+}
+
+async function setGlobalWorldSettings(settings: GlobalWorldSettings) {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+
+  const nextProgress = {
+    ...root,
+    globalWorld: settings
+  };
+
+  await prisma.user.update({
+    where: {
+      id: systemUser.id
+    },
+    data: {
+      progress: toJsonValue(nextProgress)
+    }
+  });
+
+  return settings;
 }
 
 async function findOrCreateTelegramUser(initData: string): Promise<DbUser> {
@@ -472,17 +626,41 @@ async function requireTelegramAuth(
     const initData = getInitDataFromRequest(req);
     const dbUser = await findOrCreateTelegramUser(initData);
 
+    if (isBannedProgress(dbUser.progress)) {
+      throw new BannedError();
+    }
+
     (req as AuthenticatedRequest).dbUser = dbUser;
     next();
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unauthorized request";
 
-    res.status(401).json({
+    const statusCode = error instanceof BannedError ? 403 : 401;
+
+    res.status(statusCode).json({
       ok: false,
       error: message
     });
   }
+}
+
+async function findUserOr404(userId: string, res: Response) {
+  const user = await prisma.user.findUnique({
+    where: {
+      id: userId
+    }
+  });
+
+  if (!user || user.telegramId === SYSTEM_TELEGRAM_ID) {
+    res.status(404).json({
+      ok: false,
+      error: "User not found"
+    });
+    return null;
+  }
+
+  return user;
 }
 
 app.get("/api/health", (_req, res) => {
@@ -496,6 +674,13 @@ app.post("/api/auth/telegram", async (req, res) => {
   try {
     const initData = getInitDataFromRequest(req);
     const dbUser = await findOrCreateTelegramUser(initData);
+
+    if (isBannedProgress(dbUser.progress)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Player is banned"
+      });
+    }
 
     res.json({
       ok: true,
@@ -521,33 +706,77 @@ app.get("/api/me", requireTelegramAuth, (req, res) => {
   });
 });
 
-app.get("/api/progress", requireTelegramAuth, (req, res) => {
-  const authReq = req as AuthenticatedRequest;
+app.get("/api/progress", requireTelegramAuth, async (req, res, next) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const globalWorld = await getGlobalWorldSettings();
 
-  res.json({
-    ok: true,
-    progress: sanitizeProgress(authReq.dbUser?.progress ?? {})
-  });
+    res.json({
+      ok: true,
+      progress: buildEffectiveProgress(authReq.dbUser?.progress ?? {}, globalWorld)
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/progress", requireTelegramAuth, async (req, res, next) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    const cleanProgress = sanitizeProgress(req.body?.progress ?? {});
-    const progress = toJsonValue(cleanProgress);
+    const existingProgress = sanitizeProgress(authReq.dbUser?.progress ?? {});
+    const nextProgress = sanitizeProgress(req.body?.progress ?? {});
+    const globalWorld = await getGlobalWorldSettings();
+
+    nextProgress.admin = existingProgress.admin;
+    nextProgress.world.weather = globalWorld.weather;
+    nextProgress.world.timeOfDay = globalWorld.timeOfDay;
+    nextProgress.world.eventName = globalWorld.eventName;
 
     const updatedUser = await prisma.user.update({
       where: {
         id: authReq.dbUser!.id
       },
       data: {
-        progress
+        progress: toJsonValue(nextProgress)
       }
     });
 
     res.json({
       ok: true,
-      progress: sanitizeProgress(updatedUser.progress ?? {})
+      progress: buildEffectiveProgress(updatedUser.progress ?? {}, globalWorld)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/world", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const settings = await getGlobalWorldSettings();
+
+    res.json({
+      ok: true,
+      world: settings
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/world", requireAdminSecret, async (req, res, next) => {
+  try {
+    const current = await getGlobalWorldSettings();
+    const nextSettings = sanitizeGlobalWorldSettings({
+      weather: req.body?.weather ?? current.weather,
+      timeOfDay: req.body?.timeOfDay ?? current.timeOfDay,
+      eventName: req.body?.eventName ?? current.eventName
+    });
+
+    await setGlobalWorldSettings(nextSettings);
+
+    res.json({
+      ok: true,
+      world: nextSettings
     });
   } catch (error) {
     next(error);
@@ -562,10 +791,12 @@ app.get("/api/admin/users", requireAdminSecret, async (_req, res, next) => {
       }
     });
 
+    const visibleUsers = users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
+
     res.json({
       ok: true,
-      total: users.length,
-      users: users.map((user) => ({
+      total: visibleUsers.length,
+      users: visibleUsers.map((user) => ({
         id: user.id,
         telegramId: user.telegramId.toString(),
         username: user.username,
@@ -594,17 +825,10 @@ app.get("/api/admin/users/:id", requireAdminSecret, async (req, res, next) => {
       });
     }
 
-    const user = await prisma.user.findUnique({
-      where: {
-        id: userId
-      }
-    });
+    const user = await findUserOr404(userId, res);
 
     if (!user) {
-      return res.status(404).json({
-        ok: false,
-        error: "User not found"
-      });
+      return;
     }
 
     res.json({
@@ -641,18 +865,13 @@ app.get(
         });
       }
 
-      const user = await prisma.user.findUnique({
-        where: {
-          id: userId
-        }
-      });
+      const user = await findUserOr404(userId, res);
 
       if (!user) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found"
-        });
+        return;
       }
+
+      const globalWorld = await getGlobalWorldSettings();
 
       res.json({
         ok: true,
@@ -660,16 +879,18 @@ app.get(
           id: user.id,
           telegramId: user.telegramId.toString(),
           username: user.username,
-          firstName: user.firstName
+          firstName: user.firstName,
+          lastName: user.lastName,
+          updatedAt: user.updatedAt,
+          summary: buildProgressSummary(user.progress ?? {})
         },
-        progress: sanitizeProgress(user.progress ?? {})
+        progress: buildEffectiveProgress(user.progress ?? {}, globalWorld)
       });
     } catch (error) {
       next(error);
     }
   }
 );
-
 
 app.post(
   "/api/admin/users/:id/coins",
@@ -695,17 +916,10 @@ app.post(
         });
       }
 
-      const user = await prisma.user.findUnique({
-        where: {
-          id: userId
-        }
-      });
+      const user = await findUserOr404(userId, res);
 
       if (!user) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found"
-        });
+        return;
       }
 
       const safeProgress = sanitizeProgress(user.progress ?? {});
@@ -727,21 +941,10 @@ app.post(
         }
       });
 
-      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
-      const summary = buildProgressSummary(updatedUser.progress ?? {});
-
       res.json({
         ok: true,
-        user: {
-          id: updatedUser.id,
-          telegramId: updatedUser.telegramId.toString(),
-          username: updatedUser.username,
-          firstName: updatedUser.firstName,
-          lastName: updatedUser.lastName,
-          updatedAt: updatedUser.updatedAt
-        },
-        progress: cleanProgress,
-        summary,
+        summary: buildProgressSummary(updatedUser.progress ?? {}),
+        progress: sanitizeProgress(updatedUser.progress ?? {}),
         adminAction: {
           type: "coins",
           mode,
@@ -755,8 +958,6 @@ app.post(
     }
   }
 );
-
-
 
 app.post(
   "/api/admin/users/:id/tasks",
@@ -794,17 +995,10 @@ app.post(
         });
       }
 
-      const user = await prisma.user.findUnique({
-        where: {
-          id: userId
-        }
-      });
+      const user = await findUserOr404(userId, res);
 
       if (!user) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found"
-        });
+        return;
       }
 
       const safeProgress = sanitizeProgress(user.progress ?? {});
@@ -817,9 +1011,6 @@ app.post(
         });
       }
 
-      const previousTask = {
-        ...safeProgress.tasks[taskIndex]
-      };
       const nextTask = {
         ...safeProgress.tasks[taskIndex]
       };
@@ -847,27 +1038,14 @@ app.post(
         }
       });
 
-      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
-      const summary = buildProgressSummary(updatedUser.progress ?? {});
-
       res.json({
         ok: true,
-        user: {
-          id: updatedUser.id,
-          telegramId: updatedUser.telegramId.toString(),
-          username: updatedUser.username,
-          firstName: updatedUser.firstName,
-          lastName: updatedUser.lastName,
-          updatedAt: updatedUser.updatedAt
-        },
-        progress: cleanProgress,
-        summary,
+        summary: buildProgressSummary(updatedUser.progress ?? {}),
+        progress: sanitizeProgress(updatedUser.progress ?? {}),
         adminAction: {
           type: "task",
           taskId,
-          action,
-          previousTask,
-          nextTask
+          action
         }
       });
     } catch (error) {
@@ -876,9 +1054,8 @@ app.post(
   }
 );
 
-
 app.post(
-  "/api/admin/users/:id/locations",
+  "/api/admin/users/:id/inventory",
   requireAdminSecret,
   async (req, res, next) => {
     try {
@@ -891,57 +1068,82 @@ app.post(
         });
       }
 
-      const locationId = toSafeString(req.body?.locationId, "").trim();
-      const action = toSafeString(req.body?.action, "").trim();
+      const itemId = toSafeString(req.body?.itemId, "").trim();
+      const itemName = toSafeString(req.body?.itemName, "").trim();
+      const itemKind = req.body?.itemKind;
+      const mode = req.body?.mode === "set" ? "set" : "add";
+      const parsedCount = parseAdminNumber(req.body?.count);
 
-      if (!locationId) {
+      if (!itemId) {
         return res.status(400).json({
           ok: false,
-          error: "Location id is missing"
+          error: "Item id is missing"
         });
       }
 
-      if (action !== "open" && action !== "close") {
+      if (parsedCount === null || parsedCount < 0) {
         return res.status(400).json({
           ok: false,
-          error: "Unknown location action"
+          error: "Count must be a non-negative number"
         });
       }
 
-      const user = await prisma.user.findUnique({
-        where: {
-          id: userId
-        }
-      });
+      if (itemName && !isInventoryKind(itemKind)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Item kind is invalid"
+        });
+      }
+
+      const user = await findUserOr404(userId, res);
 
       if (!user) {
-        return res.status(404).json({
-          ok: false,
-          error: "User not found"
-        });
+        return;
       }
 
       const safeProgress = sanitizeProgress(user.progress ?? {});
-      const locationIndex = safeProgress.locations.findIndex(
-        (location) => location.id === locationId
-      );
+      const inventoryIndex = safeProgress.inventory.findIndex((item) => item.id === itemId);
 
-      if (locationIndex === -1) {
-        return res.status(404).json({
+      if (inventoryIndex === -1 && !itemName) {
+        return res.status(400).json({
           ok: false,
-          error: "Location not found"
+          error: "Для нового предмета нужно указать название"
         });
       }
 
-      const previousLocation = {
-        ...safeProgress.locations[locationIndex]
-      };
-      const nextLocation = {
-        ...safeProgress.locations[locationIndex],
-        status: action === "open" ? "Открыто" : "Закрыто"
-      };
+      if (inventoryIndex === -1) {
+        const nextItem = {
+          id: itemId,
+          name: itemName,
+          kind: isInventoryKind(itemKind) ? itemKind : "misc",
+          count: clampInteger(parsedCount, 0, 9999)
+        };
 
-      safeProgress.locations[locationIndex] = nextLocation;
+        if (nextItem.count > 0) {
+          safeProgress.inventory.push(nextItem);
+        }
+      } else {
+        const currentItem = safeProgress.inventory[inventoryIndex];
+        const nextCount =
+          mode === "set"
+            ? clampInteger(parsedCount, 0, 9999)
+            : clampInteger(currentItem.count + parsedCount, 0, 9999);
+
+        safeProgress.inventory[inventoryIndex] = {
+          ...currentItem,
+          name: itemName || currentItem.name,
+          kind: isInventoryKind(itemKind) ? itemKind : currentItem.kind,
+          count: nextCount
+        };
+
+        if (nextCount <= 0) {
+          safeProgress.inventory.splice(inventoryIndex, 1);
+        }
+      }
+
+      safeProgress.inventory = safeProgress.inventory
+        .filter((item) => item.count > 0)
+        .slice(0, 200);
 
       const updatedUser = await prisma.user.update({
         where: {
@@ -952,27 +1154,71 @@ app.post(
         }
       });
 
-      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
-      const summary = buildProgressSummary(updatedUser.progress ?? {});
+      res.json({
+        ok: true,
+        summary: buildProgressSummary(updatedUser.progress ?? {}),
+        progress: sanitizeProgress(updatedUser.progress ?? {}),
+        adminAction: {
+          type: "inventory",
+          itemId,
+          mode,
+          count: parsedCount
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/admin/users/:id/ban",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const action = toSafeString(req.body?.action, "").trim();
+
+      if (action !== "ban" && action !== "unban") {
+        return res.status(400).json({
+          ok: false,
+          error: "Unknown ban action"
+        });
+      }
+
+      const user = await findUserOr404(userId, res);
+
+      if (!user) {
+        return;
+      }
+
+      const safeProgress = sanitizeProgress(user.progress ?? {});
+      safeProgress.admin.banned = action === "ban";
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: userId
+        },
+        data: {
+          progress: toJsonValue(safeProgress)
+        }
+      });
 
       res.json({
         ok: true,
-        user: {
-          id: updatedUser.id,
-          telegramId: updatedUser.telegramId.toString(),
-          username: updatedUser.username,
-          firstName: updatedUser.firstName,
-          lastName: updatedUser.lastName,
-          updatedAt: updatedUser.updatedAt
-        },
-        progress: cleanProgress,
-        summary,
+        summary: buildProgressSummary(updatedUser.progress ?? {}),
+        progress: sanitizeProgress(updatedUser.progress ?? {}),
         adminAction: {
-          type: "location",
-          locationId,
-          action,
-          previousLocation,
-          nextLocation
+          type: "ban",
+          action
         }
       });
     } catch (error) {
