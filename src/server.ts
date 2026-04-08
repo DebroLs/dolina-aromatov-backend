@@ -413,6 +413,28 @@ function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+
+
+function clampInteger(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function parseAdminNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+
+    if (Number.isFinite(parsed)) {
+      return Math.floor(parsed);
+    }
+  }
+
+  return null;
+}
+
 async function findOrCreateTelegramUser(initData: string): Promise<DbUser> {
   const { telegramUser } = parseAndValidateTelegramInitData(initData);
 
@@ -641,6 +663,92 @@ app.get(
           firstName: user.firstName
         },
         progress: sanitizeProgress(user.progress ?? {})
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+app.post(
+  "/api/admin/users/:id/coins",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const mode = req.body?.mode === "set" ? "set" : "add";
+      const parsedAmount = parseAdminNumber(req.body?.amount);
+
+      if (parsedAmount === null) {
+        return res.status(400).json({
+          ok: false,
+          error: "Amount must be a number"
+        });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: {
+          id: userId
+        }
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found"
+        });
+      }
+
+      const safeProgress = sanitizeProgress(user.progress ?? {});
+      const previousCoins = safeProgress.player.coins;
+
+      const nextCoins =
+        mode === "set"
+          ? clampInteger(parsedAmount, 0, 999999)
+          : clampInteger(previousCoins + parsedAmount, 0, 999999);
+
+      safeProgress.player.coins = nextCoins;
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: userId
+        },
+        data: {
+          progress: toJsonValue(safeProgress)
+        }
+      });
+
+      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
+      const summary = buildProgressSummary(updatedUser.progress ?? {});
+
+      res.json({
+        ok: true,
+        user: {
+          id: updatedUser.id,
+          telegramId: updatedUser.telegramId.toString(),
+          username: updatedUser.username,
+          firstName: updatedUser.firstName,
+          lastName: updatedUser.lastName,
+          updatedAt: updatedUser.updatedAt
+        },
+        progress: cleanProgress,
+        summary,
+        adminAction: {
+          type: "coins",
+          mode,
+          amount: parsedAmount,
+          previousCoins,
+          nextCoins
+        }
       });
     } catch (error) {
       next(error);
