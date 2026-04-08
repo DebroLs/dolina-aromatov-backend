@@ -756,6 +756,126 @@ app.post(
   }
 );
 
+
+
+app.post(
+  "/api/admin/users/:id/tasks",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const taskId = toSafeString(req.body?.taskId, "").trim();
+      const action = toSafeString(req.body?.action, "").trim();
+
+      if (!taskId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Task id is missing"
+        });
+      }
+
+      if (
+        action !== "set_done" &&
+        action !== "unset_done" &&
+        action !== "set_claimed" &&
+        action !== "unset_claimed"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Unknown task action"
+        });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: {
+          id: userId
+        }
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          ok: false,
+          error: "User not found"
+        });
+      }
+
+      const safeProgress = sanitizeProgress(user.progress ?? {});
+      const taskIndex = safeProgress.tasks.findIndex((task) => task.id === taskId);
+
+      if (taskIndex === -1) {
+        return res.status(404).json({
+          ok: false,
+          error: "Task not found"
+        });
+      }
+
+      const previousTask = {
+        ...safeProgress.tasks[taskIndex]
+      };
+      const nextTask = {
+        ...safeProgress.tasks[taskIndex]
+      };
+
+      if (action === "set_done") {
+        nextTask.done = true;
+      } else if (action === "unset_done") {
+        nextTask.done = false;
+        nextTask.claimed = false;
+      } else if (action === "set_claimed") {
+        nextTask.done = true;
+        nextTask.claimed = true;
+      } else if (action === "unset_claimed") {
+        nextTask.claimed = false;
+      }
+
+      safeProgress.tasks[taskIndex] = nextTask;
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: userId
+        },
+        data: {
+          progress: toJsonValue(safeProgress)
+        }
+      });
+
+      const cleanProgress = sanitizeProgress(updatedUser.progress ?? {});
+      const summary = buildProgressSummary(updatedUser.progress ?? {});
+
+      res.json({
+        ok: true,
+        user: {
+          id: updatedUser.id,
+          telegramId: updatedUser.telegramId.toString(),
+          username: updatedUser.username,
+          firstName: updatedUser.firstName,
+          lastName: updatedUser.lastName,
+          updatedAt: updatedUser.updatedAt
+        },
+        progress: cleanProgress,
+        summary,
+        adminAction: {
+          type: "task",
+          taskId,
+          action,
+          previousTask,
+          nextTask
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const message =
