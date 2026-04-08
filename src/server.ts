@@ -14,8 +14,16 @@ const MAX_AUTH_AGE_SECONDS = 60 * 60 * 24;
 
 type Weather = "Солнце" | "Туман" | "Дождь";
 type TimeOfDay = "Утро" | "День" | "Вечер";
-type InventoryKind = "ingredient" | "fish" | "aroma" | "resource" | "misc";
+type InventoryKind =
+  | "ingredient"
+  | "fish"
+  | "aroma"
+  | "resource"
+  | "misc"
+  | "quest"
+  | "story";
 type AlchemyStage = "idle" | "brewing" | "finalizing" | "success" | "failed";
+type TaskCategory = "story" | "daily" | "secret";
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN is missing in .env");
@@ -191,7 +199,9 @@ function isInventoryKind(value: unknown): value is InventoryKind {
     value === "fish" ||
     value === "aroma" ||
     value === "resource" ||
-    value === "misc"
+    value === "misc" ||
+    value === "quest" ||
+    value === "story"
   );
 }
 
@@ -205,6 +215,21 @@ function isAlchemyStage(value: unknown): value is AlchemyStage {
   );
 }
 
+function isTaskCategory(value: unknown): value is TaskCategory {
+  return value === "story" || value === "daily" || value === "secret";
+}
+
+function sanitizeInventoryItem(item: unknown) {
+  const safeItem = isRecord(item) ? item : {};
+
+  return {
+    id: toSafeString(safeItem.id, ""),
+    name: toSafeString(safeItem.name, ""),
+    kind: isInventoryKind(safeItem.kind) ? safeItem.kind : "misc",
+    count: toSafeNumber(safeItem.count, 0, 0, 9999)
+  };
+}
+
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
 
@@ -212,6 +237,7 @@ function sanitizeProgress(progress: unknown) {
   const worldRaw = isRecord(root.world) ? root.world : {};
   const villageRaw = isRecord(root.village) ? root.village : {};
   const visitedRaw = isRecord(villageRaw.visited) ? villageRaw.visited : {};
+  const storyRaw = isRecord(root.story) ? root.story : {};
   const alchemyRaw = isRecord(root.alchemy) ? root.alchemy : {};
   const fishingRaw = isRecord(root.fishing) ? root.fishing : {};
 
@@ -221,25 +247,31 @@ function sanitizeProgress(progress: unknown) {
 
   const inventory = inventoryRaw
     .slice(0, 200)
-    .filter(isRecord)
-    .map((item) => ({
-      id: toSafeString(item.id, ""),
-      name: toSafeString(item.name, ""),
-      kind: isInventoryKind(item.kind) ? item.kind : "misc",
-      count: toSafeNumber(item.count, 0, 0, 9999)
-    }))
+    .map(sanitizeInventoryItem)
     .filter((item) => item.id && item.name);
 
   const tasks = tasksRaw
     .slice(0, 50)
     .filter(isRecord)
-    .map((task) => ({
-      id: toSafeString(task.id, ""),
-      title: toSafeString(task.title, ""),
-      description: toSafeString(task.description, ""),
-      rewardCoins: toSafeNumber(task.rewardCoins, 0, 0, 999999),
-      done: toSafeBoolean(task.done)
-    }))
+    .map((task) => {
+      const rewardItemsRaw = Array.isArray(task.rewardItems) ? task.rewardItems : [];
+
+      return {
+        id: toSafeString(task.id, ""),
+        title: toSafeString(task.title, ""),
+        description: toSafeString(task.description, ""),
+        rewardCoins: toSafeNumber(task.rewardCoins, 0, 0, 999999),
+        done: toSafeBoolean(task.done),
+        claimed: toSafeBoolean(task.claimed),
+        category: isTaskCategory(task.category) ? task.category : "story",
+        rewardItems: rewardItemsRaw
+          .slice(0, 10)
+          .map(sanitizeInventoryItem)
+          .filter((item) => item.id && item.name),
+        unlockComicId: toNullableString(task.unlockComicId),
+        nextQuestId: toNullableString(task.nextQuestId)
+      };
+    })
     .filter((task) => task.id && task.title);
 
   const locations = locationsRaw
@@ -260,6 +292,13 @@ function sanitizeProgress(progress: unknown) {
     .filter((value): value is string => typeof value === "string")
     .slice(0, 3);
 
+  const unlockedComics = (Array.isArray(storyRaw.unlockedComics)
+    ? storyRaw.unlockedComics
+    : []
+  )
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .slice(0, 100);
+
   return {
     player: {
       name: toSafeString(playerRaw.name, "Путешественник"),
@@ -279,6 +318,10 @@ function sanitizeProgress(progress: unknown) {
       },
       caughtFirstFish: toSafeBoolean(villageRaw.caughtFirstFish),
       brewedFirstAroma: toSafeBoolean(villageRaw.brewedFirstAroma)
+    },
+    story: {
+      unlockedComics,
+      firstTrailsGatherDone: toSafeBoolean(storyRaw.firstTrailsGatherDone)
     },
     inventory,
     tasks,
@@ -312,6 +355,7 @@ function buildProgressSummary(progress: unknown) {
   return {
     coins: safe.player.coins,
     tasksDone: safe.tasks.filter((task) => task.done).length,
+    tasksClaimed: safe.tasks.filter((task) => task.claimed).length,
     tasksTotal: safe.tasks.length,
     inventoryItems: safe.inventory.length,
     inventoryCount: safe.inventory.reduce((sum, item) => sum + item.count, 0),
@@ -506,6 +550,7 @@ app.get("/api/admin/users", requireAdminSecret, async (_req, res, next) => {
         firstName: user.firstName,
         lastName: user.lastName,
         languageCode: user.languageCode,
+        photoUrl: user.photoUrl,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         summary: buildProgressSummary(user.progress ?? {})
