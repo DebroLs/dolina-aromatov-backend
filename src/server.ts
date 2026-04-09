@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import cors from "cors";
 import crypto from "crypto";
@@ -13,6 +12,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 const MAX_AUTH_AGE_SECONDS = 60 * 60 * 24;
 const SYSTEM_TELEGRAM_ID = BigInt(0);
+
+const DEFAULT_PLAYER_NAME = "Путешественник";
+const DEFAULT_PLAYER_COINS = 120;
 
 type Weather = "Солнце" | "Туман" | "Дождь";
 type TimeOfDay = "Утро" | "День" | "Вечер";
@@ -333,22 +335,20 @@ function sanitizeProgress(progress: unknown) {
 
   const selectedIngredients = (Array.isArray(alchemyRaw.selectedIngredients)
     ? alchemyRaw.selectedIngredients
-    : []
-  )
+    : [])
     .filter((value): value is string => typeof value === "string")
     .slice(0, 3);
 
   const unlockedComics = (Array.isArray(storyRaw.unlockedComics)
     ? storyRaw.unlockedComics
-    : []
-  )
+    : [])
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .slice(0, 100);
 
   return {
     player: {
-      name: toSafeString(playerRaw.name, "Путешественник"),
-      coins: toSafeNumber(playerRaw.coins, 120, 0, 999999)
+      name: toSafeString(playerRaw.name, DEFAULT_PLAYER_NAME),
+      coins: toSafeNumber(playerRaw.coins, DEFAULT_PLAYER_COINS, 0, 999999)
     },
     world: {
       weather: isWeather(worldRaw.weather) ? worldRaw.weather : "Солнце",
@@ -411,6 +411,22 @@ function buildEffectiveProgress(progress: unknown, globalWorld: GlobalWorldSetti
       eventName: globalWorld.eventName
     }
   };
+}
+
+function countVisitedFlags(visited: {
+  keepers: boolean;
+  alchemy: boolean;
+  workshop: boolean;
+  fishing: boolean;
+  paths: boolean;
+}) {
+  return [
+    visited.keepers,
+    visited.alchemy,
+    visited.workshop,
+    visited.fishing,
+    visited.paths
+  ].filter(Boolean).length;
 }
 
 function getLevelFromSummary(summary: {
@@ -497,6 +513,190 @@ function buildProgressSummary(progress: unknown) {
     level,
     actLabel: getActLabelByLevel(level)
   };
+}
+
+function looksLikeFreshStartProgress(progress: unknown) {
+  const safe = sanitizeProgress(progress);
+  const summary = buildProgressSummary(safe);
+  const visitedCount = countVisitedFlags(safe.village.visited);
+
+  return (
+    safe.player.name === DEFAULT_PLAYER_NAME &&
+    safe.player.coins <= DEFAULT_PLAYER_COINS &&
+    visitedCount <= 1 &&
+    !safe.village.caughtFirstFish &&
+    !safe.village.brewedFirstAroma &&
+    !safe.story.firstTrailsGatherDone &&
+    safe.story.unlockedComics.length <= 1 &&
+    summary.tasksClaimed === 0 &&
+    summary.catches === 0 &&
+    summary.perfectCatches === 0 &&
+    summary.aromasCount === 0 &&
+    safe.inventory.length <= 4
+  );
+}
+
+function hasMeaningfulProgress(progress: unknown) {
+  const safe = sanitizeProgress(progress);
+  const summary = buildProgressSummary(safe);
+  const visitedCount = countVisitedFlags(safe.village.visited);
+
+  return (
+    summary.tasksClaimed > 0 ||
+    summary.tasksDone > 1 ||
+    summary.catches > 0 ||
+    summary.perfectCatches > 0 ||
+    summary.aromasCount > 0 ||
+    safe.story.firstTrailsGatherDone ||
+    safe.village.caughtFirstFish ||
+    safe.village.brewedFirstAroma ||
+    visitedCount >= 3 ||
+    safe.story.unlockedComics.length > 1 ||
+    summary.coins > DEFAULT_PLAYER_COINS ||
+    safe.inventory.length > 4
+  );
+}
+
+function shouldRejectSuspiciousProgressSave(existingProgress: unknown, incomingProgress: unknown) {
+  const existingSafe = sanitizeProgress(existingProgress);
+  const incomingSafe = sanitizeProgress(incomingProgress);
+
+  const existingSummary = buildProgressSummary(existingSafe);
+  const incomingSummary = buildProgressSummary(incomingSafe);
+
+  const existingVisitedCount = countVisitedFlags(existingSafe.village.visited);
+  const incomingVisitedCount = countVisitedFlags(incomingSafe.village.visited);
+
+  const incomingLooksLikeFreshStart = looksLikeFreshStartProgress(incomingSafe);
+  const existingHasRealProgress = hasMeaningfulProgress(existingSafe);
+
+  const largeRollbackDetected =
+    incomingSummary.tasksClaimed < existingSummary.tasksClaimed ||
+    incomingSummary.tasksDone + 1 < existingSummary.tasksDone ||
+    incomingSummary.catches < existingSummary.catches ||
+    incomingSummary.perfectCatches < existingSummary.perfectCatches ||
+    incomingSummary.aromasCount < existingSummary.aromasCount ||
+    incomingSafe.story.unlockedComics.length < existingSafe.story.unlockedComics.length ||
+    incomingVisitedCount + 1 < existingVisitedCount ||
+    (existingSummary.coins > DEFAULT_PLAYER_COINS && incomingSummary.coins <= DEFAULT_PLAYER_COINS) ||
+    (existingSafe.inventory.length > 6 && incomingSafe.inventory.length <= 4);
+
+  return incomingLooksLikeFreshStart && existingHasRealProgress && largeRollbackDetected;
+}
+
+function mergeTasksForPlayerSave(existingTasks: ReturnType<typeof sanitizeProgress>["tasks"], incomingTasks: ReturnType<typeof sanitizeProgress>["tasks"]) {
+  const byId = new Map<string, (typeof incomingTasks)[number]>();
+
+  existingTasks.forEach((task) => {
+    byId.set(task.id, { ...task });
+  });
+
+  incomingTasks.forEach((task) => {
+    const previous = byId.get(task.id);
+
+    if (!previous) {
+      byId.set(task.id, { ...task });
+      return;
+    }
+
+    byId.set(task.id, {
+      ...previous,
+      ...task,
+      done: previous.done || task.done || task.claimed,
+      claimed: previous.claimed || task.claimed
+    });
+  });
+
+  return Array.from(byId.values());
+}
+
+function mergeLocationsForPlayerSave(existingLocations: ReturnType<typeof sanitizeProgress>["locations"], incomingLocations: ReturnType<typeof sanitizeProgress>["locations"]) {
+  const byId = new Map<string, (typeof incomingLocations)[number]>();
+
+  existingLocations.forEach((location) => {
+    byId.set(location.id, { ...location });
+  });
+
+  incomingLocations.forEach((location) => {
+    const previous = byId.get(location.id);
+
+    if (!previous) {
+      byId.set(location.id, { ...location });
+      return;
+    }
+
+    byId.set(location.id, {
+      ...previous,
+      ...location,
+      status:
+        previous.status === "Открыто" || location.status === "Открыто"
+          ? "Открыто"
+          : "Закрыто"
+    });
+  });
+
+  return Array.from(byId.values());
+}
+
+function mergePlayerProgressForSave(
+  existingProgress: unknown,
+  incomingProgress: unknown,
+  globalWorld: GlobalWorldSettings
+) {
+  const existingSafe = sanitizeProgress(existingProgress);
+  const incomingSafe = sanitizeProgress(incomingProgress);
+
+  if (shouldRejectSuspiciousProgressSave(existingSafe, incomingSafe)) {
+    console.warn(
+      `[SAFE_SAVE] Rejected suspicious reset for user progress. Existing coins=${existingSafe.player.coins}, incoming coins=${incomingSafe.player.coins}`
+    );
+
+    return buildEffectiveProgress(existingSafe, globalWorld);
+  }
+
+  const merged = sanitizeProgress({
+    ...incomingSafe,
+    village: {
+      ...incomingSafe.village,
+      visited: {
+        keepers: existingSafe.village.visited.keepers || incomingSafe.village.visited.keepers,
+        alchemy: existingSafe.village.visited.alchemy || incomingSafe.village.visited.alchemy,
+        workshop: existingSafe.village.visited.workshop || incomingSafe.village.visited.workshop,
+        fishing: existingSafe.village.visited.fishing || incomingSafe.village.visited.fishing,
+        paths: existingSafe.village.visited.paths || incomingSafe.village.visited.paths
+      },
+      caughtFirstFish:
+        existingSafe.village.caughtFirstFish || incomingSafe.village.caughtFirstFish,
+      brewedFirstAroma:
+        existingSafe.village.brewedFirstAroma || incomingSafe.village.brewedFirstAroma
+    },
+    story: {
+      unlockedComics: Array.from(
+        new Set([
+          ...existingSafe.story.unlockedComics,
+          ...incomingSafe.story.unlockedComics
+        ])
+      ).slice(0, 100),
+      firstTrailsGatherDone:
+        existingSafe.story.firstTrailsGatherDone || incomingSafe.story.firstTrailsGatherDone
+    },
+    tasks: mergeTasksForPlayerSave(existingSafe.tasks, incomingSafe.tasks),
+    locations: mergeLocationsForPlayerSave(existingSafe.locations, incomingSafe.locations),
+    admin: existingSafe.admin
+  });
+
+  merged.world.weather = globalWorld.weather;
+  merged.world.timeOfDay = globalWorld.timeOfDay;
+  merged.world.eventName = globalWorld.eventName;
+
+  if (
+    merged.player.name === DEFAULT_PLAYER_NAME &&
+    existingSafe.player.name !== DEFAULT_PLAYER_NAME
+  ) {
+    merged.player.name = existingSafe.player.name;
+  }
+
+  return merged;
 }
 
 function getAdminSecretFromRequest(req: Request): string {
@@ -723,21 +923,20 @@ app.get("/api/progress", requireTelegramAuth, async (req, res, next) => {
 app.post("/api/progress", requireTelegramAuth, async (req, res, next) => {
   try {
     const authReq = req as AuthenticatedRequest;
-    const existingProgress = sanitizeProgress(authReq.dbUser?.progress ?? {});
-    const nextProgress = sanitizeProgress(req.body?.progress ?? {});
     const globalWorld = await getGlobalWorldSettings();
 
-    nextProgress.admin = existingProgress.admin;
-    nextProgress.world.weather = globalWorld.weather;
-    nextProgress.world.timeOfDay = globalWorld.timeOfDay;
-    nextProgress.world.eventName = globalWorld.eventName;
+    const mergedProgress = mergePlayerProgressForSave(
+      authReq.dbUser?.progress ?? {},
+      req.body?.progress ?? {},
+      globalWorld
+    );
 
     const updatedUser = await prisma.user.update({
       where: {
         id: authReq.dbUser!.id
       },
       data: {
-        progress: toJsonValue(nextProgress)
+        progress: toJsonValue(mergedProgress)
       }
     });
 
