@@ -73,7 +73,7 @@ class BannedError extends Error {
 }
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 function getInitDataFromRequest(req: Request): string {
   const headerValue = req.headers["x-telegram-init-data"];
@@ -584,7 +584,10 @@ function shouldRejectSuspiciousProgressSave(existingProgress: unknown, incomingP
   return incomingLooksLikeFreshStart && existingHasRealProgress && largeRollbackDetected;
 }
 
-function mergeTasksForPlayerSave(existingTasks: ReturnType<typeof sanitizeProgress>["tasks"], incomingTasks: ReturnType<typeof sanitizeProgress>["tasks"]) {
+function mergeTasksForPlayerSave(
+  existingTasks: ReturnType<typeof sanitizeProgress>["tasks"],
+  incomingTasks: ReturnType<typeof sanitizeProgress>["tasks"]
+) {
   const byId = new Map<string, (typeof incomingTasks)[number]>();
 
   existingTasks.forEach((task) => {
@@ -610,7 +613,10 @@ function mergeTasksForPlayerSave(existingTasks: ReturnType<typeof sanitizeProgre
   return Array.from(byId.values());
 }
 
-function mergeLocationsForPlayerSave(existingLocations: ReturnType<typeof sanitizeProgress>["locations"], incomingLocations: ReturnType<typeof sanitizeProgress>["locations"]) {
+function mergeLocationsForPlayerSave(
+  existingLocations: ReturnType<typeof sanitizeProgress>["locations"],
+  incomingLocations: ReturnType<typeof sanitizeProgress>["locations"]
+) {
   const byId = new Map<string, (typeof incomingLocations)[number]>();
 
   existingLocations.forEach((location) => {
@@ -1091,6 +1097,101 @@ app.get(
   }
 );
 
+app.get("/api/admin/backup", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: {
+        updatedAt: "desc"
+      }
+    });
+
+    const globalWorld = await getGlobalWorldSettings();
+    const visibleUsers = users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
+
+    res.json({
+      ok: true,
+      exportedAt: new Date().toISOString(),
+      total: visibleUsers.length,
+      world: globalWorld,
+      users: visibleUsers.map((user) => ({
+        id: user.id,
+        telegramId: user.telegramId.toString(),
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        languageCode: user.languageCode,
+        photoUrl: user.photoUrl,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        summary: buildProgressSummary(user.progress ?? {}),
+        progress: sanitizeProgress(user.progress ?? {})
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post(
+  "/api/admin/users/:id/restore",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const userId = getSingleParam(req.params.id);
+
+      if (!userId) {
+        return res.status(400).json({
+          ok: false,
+          error: "User id is missing"
+        });
+      }
+
+      const user = await findUserOr404(userId, res);
+
+      if (!user) {
+        return;
+      }
+
+      const incomingProgress = req.body?.progress;
+
+      if (!incomingProgress || !isRecord(incomingProgress)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Progress object is missing"
+        });
+      }
+
+      const globalWorld = await getGlobalWorldSettings();
+      const restoredProgress = sanitizeProgress(incomingProgress);
+
+      restoredProgress.world.weather = globalWorld.weather;
+      restoredProgress.world.timeOfDay = globalWorld.timeOfDay;
+      restoredProgress.world.eventName = globalWorld.eventName;
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: userId
+        },
+        data: {
+          progress: toJsonValue(restoredProgress)
+        }
+      });
+
+      res.json({
+        ok: true,
+        summary: buildProgressSummary(updatedUser.progress ?? {}),
+        progress: sanitizeProgress(updatedUser.progress ?? {}),
+        adminAction: {
+          type: "restore",
+          userId
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.post(
   "/api/admin/users/:id/coins",
   requireAdminSecret,
@@ -1425,43 +1526,6 @@ app.post(
     }
   }
 );
-
-
-app.get("/api/admin/backup", requireAdminSecret, async (_req, res, next) => {
-  try {
-    const globalWorld = await getGlobalWorldSettings();
-    const users = await prisma.user.findMany({
-      orderBy: {
-        updatedAt: "desc"
-      }
-    });
-
-    const visibleUsers = users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
-
-    res.json({
-      ok: true,
-      exportedAt: new Date().toISOString(),
-      world: globalWorld,
-      total: visibleUsers.length,
-      users: visibleUsers.map((user) => ({
-        id: user.id,
-        telegramId: user.telegramId.toString(),
-        username: user.username,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        languageCode: user.languageCode,
-        photoUrl: user.photoUrl,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-        summary: buildProgressSummary(user.progress ?? {}),
-        progress: buildEffectiveProgress(user.progress ?? {}, globalWorld)
-      }))
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
 
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
