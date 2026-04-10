@@ -1426,6 +1426,43 @@ app.post(
   }
 );
 
+
+app.get("/api/admin/backup", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const globalWorld = await getGlobalWorldSettings();
+    const users = await prisma.user.findMany({
+      orderBy: {
+        updatedAt: "desc"
+      }
+    });
+
+    const visibleUsers = users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
+
+    res.json({
+      ok: true,
+      exportedAt: new Date().toISOString(),
+      world: globalWorld,
+      total: visibleUsers.length,
+      users: visibleUsers.map((user) => ({
+        id: user.id,
+        telegramId: user.telegramId.toString(),
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        languageCode: user.languageCode,
+        photoUrl: user.photoUrl,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        summary: buildProgressSummary(user.progress ?? {}),
+        progress: buildEffectiveProgress(user.progress ?? {}, globalWorld)
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const message =
