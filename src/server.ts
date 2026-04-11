@@ -38,6 +38,7 @@ type SystemAnnouncementSettings = {
   enabled: boolean;
   title: string;
   message: string;
+  targetSegments: string[];
 };
 type AdminLogEntry = {
   id: string;
@@ -265,6 +266,19 @@ function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
 }
 function sanitizeSystemAnnouncementSettings(value: unknown): SystemAnnouncementSettings {
   const safeValue = isRecord(value) ? value : {};
+  const rawTargetSegments = Array.isArray(safeValue.targetSegments)
+    ? safeValue.targetSegments
+    : [];
+
+  const targetSegments = Array.from(
+    new Set(
+      rawTargetSegments
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim().slice(0, 40))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+
   return {
     enabled: safeValue.enabled === true,
     title: toSafeString(safeValue.title, "Объявление").slice(0, 100) || "Объявление",
@@ -272,7 +286,8 @@ function sanitizeSystemAnnouncementSettings(value: unknown): SystemAnnouncementS
       toSafeString(
         safeValue.message,
         ""
-      ).slice(0, 800)
+      ).slice(0, 800),
+    targetSegments
   };
 }
 
@@ -1212,6 +1227,46 @@ app.post("/api/admin/world/restore", requireAdminSecret, async (req, res, next) 
       adminAction: {
         type: "restore_world"
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/announcement", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const announcement = await getSystemAnnouncementSettings();
+
+    res.json({
+      ok: true,
+      announcement
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/announcement", requireAdminSecret, async (req, res, next) => {
+  try {
+    const current = await getSystemAnnouncementSettings();
+    const nextAnnouncement = sanitizeSystemAnnouncementSettings({
+      enabled: req.body?.enabled ?? current.enabled,
+      title: req.body?.title ?? current.title,
+      message: req.body?.message ?? current.message,
+      targetSegments: req.body?.targetSegments ?? current.targetSegments
+    });
+
+    await setSystemAnnouncementSettings(nextAnnouncement);
+    await appendAdminLog("announcement_update", "announcement", "global", "Глобальное объявление", {
+      enabled: nextAnnouncement.enabled,
+      title: nextAnnouncement.title,
+      targetSegments: nextAnnouncement.targetSegments,
+      scope: nextAnnouncement.targetSegments.length > 0 ? "segments" : "all"
+    });
+
+    res.json({
+      ok: true,
+      announcement: nextAnnouncement
     });
   } catch (error) {
     next(error);
