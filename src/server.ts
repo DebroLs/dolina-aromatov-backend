@@ -33,6 +33,7 @@ type SystemStatusSettings = {
   maintenanceEnabled: boolean;
   title: string;
   message: string;
+  targetSegments: string[];
 };
 type SystemAnnouncementSettings = {
   enabled: boolean;
@@ -253,6 +254,19 @@ function sanitizeGlobalWorldSettings(value: unknown): GlobalWorldSettings {
 }
 function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
   const safeValue = isRecord(value) ? value : {};
+  const rawTargetSegments = Array.isArray(safeValue.targetSegments)
+    ? safeValue.targetSegments
+    : [];
+
+  const targetSegments = Array.from(
+    new Set(
+      rawTargetSegments
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim().slice(0, 40))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+
   return {
     maintenanceEnabled: safeValue.maintenanceEnabled === true,
     title: toSafeString(safeValue.title, "Технические работы").slice(0, 100) || "Технические работы",
@@ -261,7 +275,8 @@ function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
         safeValue.message,
         "Сейчас в игре идут технические работы. Попробуй зайти немного позже."
       ).slice(0, 600) ||
-      "Сейчас в игре идут технические работы. Попробуй зайти немного позже."
+      "Сейчас в игре идут технические работы. Попробуй зайти немного позже.",
+    targetSegments
   };
 }
 function sanitizeSystemAnnouncementSettings(value: unknown): SystemAnnouncementSettings {
@@ -297,6 +312,25 @@ function sanitizePlayerSegment(value: unknown) {
 
 function getSegmentLabel(value: string) {
   return value || "Без сегмента";
+}
+
+function getPlayerSegmentFromProgress(progress: unknown) {
+  return sanitizeProgress(progress).admin.segment;
+}
+
+function isMaintenanceActiveForSegment(
+  systemStatus: SystemStatusSettings,
+  playerSegment: string
+) {
+  if (!systemStatus.maintenanceEnabled) {
+    return false;
+  }
+
+  if (systemStatus.targetSegments.length === 0) {
+    return true;
+  }
+
+  return systemStatus.targetSegments.includes(playerSegment);
 }
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
@@ -781,7 +815,8 @@ async function getOrCreateSystemUser() {
         systemStatus: {
           maintenanceEnabled: false,
           title: "Технические работы",
-          message: "Сейчас в игре идут технические работы. Попробуй зайти немного позже."
+          message: "Сейчас в игре идут технические работы. Попробуй зайти немного позже.",
+          targetSegments: []
         }
       }
     }
@@ -1037,8 +1072,9 @@ async function requireTelegramAuth(
     const initData = getInitDataFromRequest(req);
     const dbUser = await findOrCreateTelegramUser(initData);
     const systemStatus = await getSystemStatusSettings();
+    const playerSegment = getPlayerSegmentFromProgress(dbUser.progress);
 
-    if (systemStatus.maintenanceEnabled) {
+    if (isMaintenanceActiveForSegment(systemStatus, playerSegment)) {
       throw new MaintenanceError(systemStatus);
     }
 
@@ -1120,13 +1156,16 @@ app.post("/api/admin/system-status", requireAdminSecret, async (req, res, next) 
     const nextSystem = sanitizeSystemStatusSettings({
       maintenanceEnabled: req.body?.maintenanceEnabled ?? current.maintenanceEnabled,
       title: req.body?.title ?? current.title,
-      message: req.body?.message ?? current.message
+      message: req.body?.message ?? current.message,
+      targetSegments: req.body?.targetSegments ?? current.targetSegments
     });
 
     await setSystemStatusSettings(nextSystem);
     await appendAdminLog("maintenance_update", "system", "global", "Системный статус", {
       maintenanceEnabled: nextSystem.maintenanceEnabled,
-      title: nextSystem.title
+      title: nextSystem.title,
+      targetSegments: nextSystem.targetSegments,
+      scope: nextSystem.targetSegments.length > 0 ? "segments" : "all"
     });
 
     const announcement = await getSystemAnnouncementSettings();
@@ -1147,8 +1186,9 @@ app.post("/api/auth/telegram", async (req, res) => {
     const initData = getInitDataFromRequest(req);
     const dbUser = await findOrCreateTelegramUser(initData);
     const systemStatus = await getSystemStatusSettings();
+    const playerSegment = getPlayerSegmentFromProgress(dbUser.progress);
 
-    if (systemStatus.maintenanceEnabled) {
+    if (isMaintenanceActiveForSegment(systemStatus, playerSegment)) {
       return res.status(503).json({
         ok: false,
         error: systemStatus.title || "Технические работы"
