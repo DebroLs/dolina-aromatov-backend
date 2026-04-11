@@ -1096,6 +1096,52 @@ app.get("/api/system/status", async (_req, res, next) => {
     next(error);
   }
 });
+
+app.get("/api/admin/system-status", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const system = await getSystemStatusSettings();
+    const announcement = await getSystemAnnouncementSettings();
+
+    res.json({
+      ok: true,
+      system: {
+        ...system,
+        announcement
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/system-status", requireAdminSecret, async (req, res, next) => {
+  try {
+    const current = await getSystemStatusSettings();
+    const nextSystem = sanitizeSystemStatusSettings({
+      maintenanceEnabled: req.body?.maintenanceEnabled ?? current.maintenanceEnabled,
+      title: req.body?.title ?? current.title,
+      message: req.body?.message ?? current.message
+    });
+
+    await setSystemStatusSettings(nextSystem);
+    await appendAdminLog("maintenance_update", "system", "global", "Системный статус", {
+      maintenanceEnabled: nextSystem.maintenanceEnabled,
+      title: nextSystem.title
+    });
+
+    const announcement = await getSystemAnnouncementSettings();
+
+    res.json({
+      ok: true,
+      system: {
+        ...nextSystem,
+        announcement
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 app.post("/api/auth/telegram", async (req, res) => {
   try {
     const initData = getInitDataFromRequest(req);
