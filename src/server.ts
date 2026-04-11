@@ -598,6 +598,59 @@ function mergePlayerProgressForSave(
   }
   return merged;
 }
+
+function applyInventoryChangeToProgress(
+  progress: unknown,
+  itemId: string,
+  itemName: string,
+  itemKind: unknown,
+  mode: "set" | "add",
+  parsedCount: number
+) {
+  const safeProgress = sanitizeProgress(progress ?? {});
+  const inventoryIndex = safeProgress.inventory.findIndex((item) => item.id === itemId);
+
+  if (inventoryIndex === -1) {
+    if (!itemName) {
+      throw new Error("Для нового предмета нужно указать название");
+    }
+
+    const nextItem = {
+      id: itemId,
+      name: itemName,
+      kind: isInventoryKind(itemKind) ? itemKind : "misc",
+      count: clampInteger(parsedCount, 0, 9999)
+    };
+
+    if (nextItem.count > 0) {
+      safeProgress.inventory.push(nextItem);
+    }
+  } else {
+    const currentItem = safeProgress.inventory[inventoryIndex];
+    const nextCount =
+      mode === "set"
+        ? clampInteger(parsedCount, 0, 9999)
+        : clampInteger(currentItem.count + parsedCount, 0, 9999);
+
+    safeProgress.inventory[inventoryIndex] = {
+      ...currentItem,
+      name: itemName || currentItem.name,
+      kind: isInventoryKind(itemKind) ? itemKind : currentItem.kind,
+      count: nextCount
+    };
+
+    if (nextCount <= 0) {
+      safeProgress.inventory.splice(inventoryIndex, 1);
+    }
+  }
+
+  safeProgress.inventory = safeProgress.inventory
+    .filter((item) => item.count > 0)
+    .slice(0, 200);
+
+  return safeProgress;
+}
+
 function getAdminSecretFromRequest(req: Request): string {
   const headerSecret = req.headers["x-admin-secret"];
   const querySecret = req.query.secret;
@@ -1439,6 +1492,126 @@ app.post(
     }
   }
 );
+
+app.post(
+  "/api/admin/bulk/inventory",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const scope = req.body?.scope === "all" ? "all" : "selected";
+      const rawUserIds: unknown[] = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+      const userIds = rawUserIds
+        .filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value: string) => value.trim());
+
+      const itemId = toSafeString(req.body?.itemId, "").trim();
+      const itemName = toSafeString(req.body?.itemName, "").trim();
+      const itemKind = req.body?.itemKind;
+      const mode = req.body?.mode === "set" ? "set" : "add";
+      const parsedCount = parseAdminNumber(req.body?.count);
+
+      if (!itemId) {
+        return res.status(400).json({
+          ok: false,
+          error: "Item id is missing"
+        });
+      }
+
+      if (parsedCount === null || parsedCount < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Count must be a non-negative number"
+        });
+      }
+
+      if (itemName && !isInventoryKind(itemKind)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Item kind is invalid"
+        });
+      }
+
+      if (scope === "selected" && userIds.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "No users selected"
+        });
+      }
+
+      const users = await prisma.user.findMany({
+        where:
+          scope === "all"
+            ? {
+                telegramId: {
+                  not: SYSTEM_TELEGRAM_ID
+                }
+              }
+            : {
+                id: {
+                  in: userIds
+                },
+                telegramId: {
+                  not: SYSTEM_TELEGRAM_ID
+                }
+              }
+      });
+
+      if (users.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Users not found"
+        });
+      }
+
+      const updatedUsers = await Promise.all(
+        users.map(async (user) => {
+          const nextProgress = applyInventoryChangeToProgress(
+            user.progress ?? {},
+            itemId,
+            itemName,
+            itemKind,
+            mode,
+            parsedCount
+          );
+
+          return prisma.user.update({
+            where: {
+              id: user.id
+            },
+            data: {
+              progress: toJsonValue(nextProgress)
+            }
+          });
+        })
+      );
+
+      res.json({
+        ok: true,
+        affected: updatedUsers.length,
+        users: updatedUsers.map((user) => ({
+          id: user.id,
+          telegramId: user.telegramId.toString(),
+          username: user.username,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          summary: buildProgressSummary(user.progress ?? {})
+        })),
+        adminAction: {
+          type: "bulk_inventory",
+          scope,
+          itemId,
+          itemName,
+          itemKind: isInventoryKind(itemKind) ? itemKind : "misc",
+          mode,
+          count: parsedCount
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.use(
   (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const message =
