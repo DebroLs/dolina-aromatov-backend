@@ -673,6 +673,22 @@ async function setGlobalWorldSettings(settings: GlobalWorldSettings) {
   });
   return settings;
 }
+
+function getVisibleUsers(users: DbUser[]) {
+  return users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
+}
+
+type BulkAdminAction = "add_coins" | "set_coins" | "ban" | "unban";
+
+function isBulkAdminAction(value: unknown): value is BulkAdminAction {
+  return (
+    value === "add_coins" ||
+    value === "set_coins" ||
+    value === "ban" ||
+    value === "unban"
+  );
+}
+
 async function findOrCreateTelegramUser(initData: string): Promise<DbUser> {
   const { telegramUser } = parseAndValidateTelegramInitData(initData);
   const dbUser = await prisma.user.upsert({
@@ -1036,6 +1052,109 @@ app.post(
     }
   }
 );
+
+app.post(
+  "/api/admin/users/bulk",
+  requireAdminSecret,
+  async (req, res, next) => {
+    try {
+      const action = req.body?.action;
+      const applyToAll = req.body?.applyToAll === true;
+      const rawUserIds: unknown[] = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+      const userIds = rawUserIds
+        .filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
+        .map((value: string) => value.trim());
+      const amount = parseAdminNumber(req.body?.amount);
+
+      if (!isBulkAdminAction(action)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Unknown bulk action"
+        });
+      }
+
+      if ((action === "add_coins" || action === "set_coins") && amount === null) {
+        return res.status(400).json({
+          ok: false,
+          error: "Amount must be a number"
+        });
+      }
+
+      const allUsers = getVisibleUsers(
+        await prisma.user.findMany({
+          orderBy: {
+            updatedAt: "desc"
+          }
+        })
+      );
+
+      const targetUsers = applyToAll
+        ? allUsers
+        : allUsers.filter((user) => userIds.includes(user.id));
+
+      if (targetUsers.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "No target users selected"
+        });
+      }
+
+      const updatedResults: Array<{
+        id: string;
+        telegramId: string;
+        firstName: string;
+        username: string | null;
+        summary: ReturnType<typeof buildProgressSummary>;
+      }> = [];
+
+      for (const user of targetUsers) {
+        const safeProgress = sanitizeProgress(user.progress ?? {});
+
+        if (action === "add_coins") {
+          safeProgress.player.coins = clampInteger(
+            safeProgress.player.coins + (amount ?? 0),
+            0,
+            999999
+          );
+        } else if (action === "set_coins") {
+          safeProgress.player.coins = clampInteger(amount ?? 0, 0, 999999);
+        } else if (action === "ban") {
+          safeProgress.admin.banned = true;
+        } else if (action === "unban") {
+          safeProgress.admin.banned = false;
+        }
+
+        const updatedUser = await prisma.user.update({
+          where: {
+            id: user.id
+          },
+          data: {
+            progress: toJsonValue(safeProgress)
+          }
+        });
+
+        updatedResults.push({
+          id: updatedUser.id,
+          telegramId: updatedUser.telegramId.toString(),
+          firstName: updatedUser.firstName,
+          username: updatedUser.username,
+          summary: buildProgressSummary(updatedUser.progress ?? {})
+        });
+      }
+
+      res.json({
+        ok: true,
+        action,
+        amount: amount ?? null,
+        affected: updatedResults.length,
+        users: updatedResults
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.post(
   "/api/admin/users/:id/coins",
   requireAdminSecret,
