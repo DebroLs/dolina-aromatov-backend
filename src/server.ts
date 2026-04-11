@@ -29,6 +29,15 @@ type GlobalWorldSettings = {
   timeOfDay: TimeOfDay;
   eventName: string;
 };
+type AdminLogEntry = {
+  id: string;
+  at: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  targetLabel: string;
+  details: Record<string, unknown>;
+};
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN is missing in .env");
 }
@@ -727,6 +736,140 @@ async function setGlobalWorldSettings(settings: GlobalWorldSettings) {
   return settings;
 }
 
+function sanitizeAdminLogDetails(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return {};
+  }
+
+  const next: Record<string, unknown> = {};
+
+  for (const [key, rawValue] of Object.entries(value).slice(0, 20)) {
+    if (typeof rawValue === "string") {
+      next[key] = rawValue.slice(0, 200);
+      continue;
+    }
+
+    if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+      next[key] = rawValue;
+      continue;
+    }
+
+    if (typeof rawValue === "boolean") {
+      next[key] = rawValue;
+      continue;
+    }
+
+    if (Array.isArray(rawValue)) {
+      next[key] = rawValue.slice(0, 20).map((item) => {
+        if (typeof item === "string") {
+          return item.slice(0, 120);
+        }
+
+        if (typeof item === "number" && Number.isFinite(item)) {
+          return item;
+        }
+
+        if (typeof item === "boolean") {
+          return item;
+        }
+
+        return JSON.stringify(item).slice(0, 120);
+      });
+    }
+  }
+
+  return next;
+}
+
+function sanitizeAdminLogEntry(value: unknown): AdminLogEntry | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const id = toSafeString(value.id, "");
+  const at = toSafeString(value.at, "");
+  const action = toSafeString(value.action, "");
+  const targetType = toSafeString(value.targetType, "");
+  const targetId = toSafeString(value.targetId, "");
+  const targetLabel = toSafeString(value.targetLabel, "");
+
+  if (!id || !at || !action || !targetType || !targetId || !targetLabel) {
+    return null;
+  }
+
+  return {
+    id,
+    at,
+    action,
+    targetType,
+    targetId,
+    targetLabel,
+    details: sanitizeAdminLogDetails(value.details)
+  };
+}
+
+function makeAdminLogEntry(
+  action: string,
+  targetType: string,
+  targetId: string,
+  targetLabel: string,
+  details?: Record<string, unknown>
+): AdminLogEntry {
+  return {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    at: new Date().toISOString(),
+    action,
+    targetType,
+    targetId,
+    targetLabel,
+    details: sanitizeAdminLogDetails(details ?? {})
+  };
+}
+
+async function appendAdminLog(
+  action: string,
+  targetType: string,
+  targetId: string,
+  targetLabel: string,
+  details?: Record<string, unknown>
+) {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+  const rawLogs = Array.isArray(root.adminLogs) ? root.adminLogs : [];
+  const safeLogs = rawLogs
+    .map(sanitizeAdminLogEntry)
+    .filter((item): item is AdminLogEntry => item !== null)
+    .slice(0, 199);
+
+  const nextProgress = {
+    ...root,
+    adminLogs: [
+      makeAdminLogEntry(action, targetType, targetId, targetLabel, details),
+      ...safeLogs
+    ]
+  };
+
+  await prisma.user.update({
+    where: {
+      id: systemUser.id
+    },
+    data: {
+      progress: toJsonValue(nextProgress)
+    }
+  });
+}
+
+async function getAdminLogs(limit = 100) {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+  const rawLogs = Array.isArray(root.adminLogs) ? root.adminLogs : [];
+
+  return rawLogs
+    .map(sanitizeAdminLogEntry)
+    .filter((item): item is AdminLogEntry => item !== null)
+    .slice(0, clampInteger(limit, 1, 200));
+}
+
 function getVisibleUsers(users: DbUser[]) {
   return users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
 }
@@ -898,6 +1041,11 @@ app.post("/api/admin/world", requireAdminSecret, async (req, res, next) => {
       eventName: req.body?.eventName ?? current.eventName
     });
     await setGlobalWorldSettings(nextSettings);
+    await appendAdminLog("world_update", "world", "global", "Глобальный мир", {
+      weather: nextSettings.weather,
+      timeOfDay: nextSettings.timeOfDay,
+      eventName: nextSettings.eventName
+    });
     res.json({
       ok: true,
       world: nextSettings
@@ -917,6 +1065,11 @@ app.post("/api/admin/world/restore", requireAdminSecret, async (req, res, next) 
     }
     const restoredWorld = sanitizeGlobalWorldSettings(incomingWorld);
     await setGlobalWorldSettings(restoredWorld);
+    await appendAdminLog("world_restore", "world", "global", "Глобальный мир", {
+      weather: restoredWorld.weather,
+      timeOfDay: restoredWorld.timeOfDay,
+      eventName: restoredWorld.eventName
+    });
     res.json({
       ok: true,
       world: restoredWorld,
@@ -1023,6 +1176,21 @@ app.get(
     }
   }
 );
+app.get("/api/admin/logs", requireAdminSecret, async (req, res, next) => {
+  try {
+    const limit = clampInteger(parseAdminNumber(req.query.limit) ?? 100, 1, 200);
+    const logs = await getAdminLogs(limit);
+
+    res.json({
+      ok: true,
+      total: logs.length,
+      logs
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/admin/backup", requireAdminSecret, async (_req, res, next) => {
   try {
     const users = await prisma.user.findMany({
@@ -1032,6 +1200,10 @@ app.get("/api/admin/backup", requireAdminSecret, async (_req, res, next) => {
     });
     const globalWorld = await getGlobalWorldSettings();
     const visibleUsers = users.filter((user) => user.telegramId !== SYSTEM_TELEGRAM_ID);
+    await appendAdminLog("backup_export", "backup", "all", "Экспорт backup", {
+      users: visibleUsers.length
+    });
+
     res.json({
       ok: true,
       exportedAt: new Date().toISOString(),
@@ -1090,6 +1262,10 @@ app.post(
         data: {
           progress: toJsonValue(restoredProgress)
         }
+      });
+      await appendAdminLog("player_restore", "player", updatedUser.id, updatedUser.firstName, {
+        username: updatedUser.username ?? "",
+        telegramId: updatedUser.telegramId.toString()
       });
       res.json({
         ok: true,
@@ -1195,6 +1371,13 @@ app.post(
         });
       }
 
+      await appendAdminLog("bulk_action", "players", applyToAll ? "all" : "selected", applyToAll ? "Все игроки" : "Выбранные игроки", {
+        action,
+        amount: amount ?? null,
+        affected: updatedResults.length,
+        userIds: updatedResults.map((user) => user.id)
+      });
+
       res.json({
         ok: true,
         action,
@@ -1246,6 +1429,14 @@ app.post(
         data: {
           progress: toJsonValue(safeProgress)
         }
+      });
+      await appendAdminLog("coins_update", "player", updatedUser.id, updatedUser.firstName, {
+        username: updatedUser.username ?? "",
+        telegramId: updatedUser.telegramId.toString(),
+        mode,
+        amount: parsedAmount,
+        previousCoins,
+        nextCoins
       });
       res.json({
         ok: true,
@@ -1329,6 +1520,12 @@ app.post(
         data: {
           progress: toJsonValue(safeProgress)
         }
+      });
+      await appendAdminLog("task_update", "player", updatedUser.id, updatedUser.firstName, {
+        username: updatedUser.username ?? "",
+        telegramId: updatedUser.telegramId.toString(),
+        taskId,
+        action
       });
       res.json({
         ok: true,
@@ -1429,6 +1626,15 @@ app.post(
           progress: toJsonValue(safeProgress)
         }
       });
+      await appendAdminLog("inventory_update", "player", updatedUser.id, updatedUser.firstName, {
+        username: updatedUser.username ?? "",
+        telegramId: updatedUser.telegramId.toString(),
+        itemId,
+        itemName: itemName || "",
+        itemKind: isInventoryKind(itemKind) ? itemKind : "misc",
+        mode,
+        count: parsedCount
+      });
       res.json({
         ok: true,
         summary: buildProgressSummary(updatedUser.progress ?? {}),
@@ -1477,6 +1683,11 @@ app.post(
         data: {
           progress: toJsonValue(safeProgress)
         }
+      });
+      await appendAdminLog("ban_update", "player", updatedUser.id, updatedUser.firstName, {
+        username: updatedUser.username ?? "",
+        telegramId: updatedUser.telegramId.toString(),
+        action
       });
       res.json({
         ok: true,
@@ -1584,6 +1795,16 @@ app.post(
           });
         })
       );
+
+      await appendAdminLog("bulk_inventory", "players", scope === "all" ? "all" : "selected", scope === "all" ? "Все игроки" : "Выбранные игроки", {
+        affected: updatedUsers.length,
+        itemId,
+        itemName,
+        itemKind: isInventoryKind(itemKind) ? itemKind : "misc",
+        mode,
+        count: parsedCount,
+        userIds: updatedUsers.map((user) => user.id)
+      });
 
       res.json({
         ok: true,
