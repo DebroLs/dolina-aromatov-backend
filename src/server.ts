@@ -34,6 +34,11 @@ type SystemStatusSettings = {
   title: string;
   message: string;
 };
+type SystemAnnouncementSettings = {
+  enabled: boolean;
+  title: string;
+  message: string;
+};
 type AdminLogEntry = {
   id: string;
   at: string;
@@ -258,6 +263,26 @@ function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
       "Сейчас в игре идут технические работы. Попробуй зайти немного позже."
   };
 }
+function sanitizeSystemAnnouncementSettings(value: unknown): SystemAnnouncementSettings {
+  const safeValue = isRecord(value) ? value : {};
+  return {
+    enabled: safeValue.enabled === true,
+    title: toSafeString(safeValue.title, "Объявление").slice(0, 100) || "Объявление",
+    message:
+      toSafeString(
+        safeValue.message,
+        ""
+      ).slice(0, 800)
+  };
+}
+
+function sanitizePlayerSegment(value: unknown) {
+  return toSafeString(value, "").trim().slice(0, 40);
+}
+
+function getSegmentLabel(value: string) {
+  return value || "Без сегмента";
+}
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
   const playerRaw = isRecord(root.player) ? root.player : {};
@@ -366,7 +391,8 @@ function sanitizeProgress(progress: unknown) {
       lastCatchName: toNullableString(fishingRaw.lastCatchName)
     },
     admin: {
-      banned: toSafeBoolean(adminRaw.banned)
+      banned: toSafeBoolean(adminRaw.banned),
+      segment: sanitizePlayerSegment(adminRaw.segment)
     }
   };
 }
@@ -456,7 +482,8 @@ function buildProgressSummary(progress: unknown) {
     catches: safe.fishing.catches,
     perfectCatches: safe.fishing.perfectCatches,
     lastCatchName: safe.fishing.lastCatchName,
-    banned: safe.admin.banned
+    banned: safe.admin.banned,
+    segment: safe.admin.segment
   };
   const level = getLevelFromSummary(baseSummary);
   const progressPercent = baseSummary.tasksTotal
@@ -789,6 +816,28 @@ async function setSystemStatusSettings(settings: SystemStatusSettings) {
   });
   return settings;
 }
+async function getSystemAnnouncementSettings() {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+  return sanitizeSystemAnnouncementSettings(root.systemAnnouncement);
+}
+async function setSystemAnnouncementSettings(settings: SystemAnnouncementSettings) {
+  const systemUser = await getOrCreateSystemUser();
+  const root = isRecord(systemUser.progress) ? systemUser.progress : {};
+  const nextProgress = {
+    ...root,
+    systemAnnouncement: settings
+  };
+  await prisma.user.update({
+    where: {
+      id: systemUser.id
+    },
+    data: {
+      progress: toJsonValue(nextProgress)
+    }
+  });
+  return settings;
+}
 
 function sanitizeAdminLogDetails(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) {
@@ -1020,9 +1069,13 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/system/status", async (_req, res, next) => {
   try {
     const system = await getSystemStatusSettings();
+    const announcement = await getSystemAnnouncementSettings();
     res.json({
       ok: true,
-      system
+      system: {
+        ...system,
+        announcement
+      }
     });
   } catch (error) {
     next(error);
@@ -1268,6 +1321,182 @@ app.get("/api/admin/logs", requireAdminSecret, async (req, res, next) => {
       ok: true,
       total: logs.length,
       logs
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+app.get("/api/admin/segments", requireAdminSecret, async (_req, res, next) => {
+  try {
+    const users = getVisibleUsers(
+      await prisma.user.findMany({
+        orderBy: {
+          updatedAt: "desc"
+        }
+      })
+    );
+
+    const counts = new Map<string, number>();
+
+    for (const user of users) {
+      const summary = buildProgressSummary(user.progress ?? {});
+      const key = summary.segment || "";
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+
+    const segments = Array.from(counts.entries())
+      .map(([value, total]) => ({
+        value,
+        label: getSegmentLabel(value),
+        total
+      }))
+      .sort((a, b) => {
+        if (a.value === "" && b.value !== "") return -1;
+        if (a.value !== "" && b.value === "") return 1;
+        return a.label.localeCompare(b.label, "ru");
+      });
+
+    res.json({
+      ok: true,
+      totalUsers: users.length,
+      segments
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/users/:id/segment", requireAdminSecret, async (req, res, next) => {
+  try {
+    const userId = getSingleParam(req.params.id);
+
+    if (!userId) {
+      return res.status(400).json({
+        ok: false,
+        error: "User id is missing"
+      });
+    }
+
+    const user = await findUserOr404(userId, res);
+
+    if (!user) {
+      return;
+    }
+
+    const segment = sanitizePlayerSegment(req.body?.segment);
+    const safeProgress = sanitizeProgress(user.progress ?? {});
+    const previousSegment = safeProgress.admin.segment;
+
+    safeProgress.admin.segment = segment;
+
+    const updatedUser = await prisma.user.update({
+      where: {
+        id: userId
+      },
+      data: {
+        progress: toJsonValue(safeProgress)
+      }
+    });
+
+    await appendAdminLog("segment_update", "player", updatedUser.id, updatedUser.firstName, {
+      username: updatedUser.username ?? "",
+      telegramId: updatedUser.telegramId.toString(),
+      previousSegment,
+      nextSegment: segment
+    });
+
+    res.json({
+      ok: true,
+      summary: buildProgressSummary(updatedUser.progress ?? {}),
+      progress: sanitizeProgress(updatedUser.progress ?? {}),
+      adminAction: {
+        type: "segment",
+        previousSegment,
+        nextSegment: segment
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/segments/bulk", requireAdminSecret, async (req, res, next) => {
+  try {
+    const applyToAll = req.body?.applyToAll === true;
+    const segment = sanitizePlayerSegment(req.body?.segment);
+    const rawUserIds: unknown[] = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+    const userIds = rawUserIds
+      .filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value: string) => value.trim());
+
+    const allUsers = getVisibleUsers(
+      await prisma.user.findMany({
+        orderBy: {
+          updatedAt: "desc"
+        }
+      })
+    );
+
+    const targetUsers = applyToAll
+      ? allUsers
+      : allUsers.filter((user) => userIds.includes(user.id));
+
+    if (targetUsers.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "No target users selected"
+      });
+    }
+
+    const updatedResults: Array<{
+      id: string;
+      telegramId: string;
+      firstName: string;
+      username: string | null;
+      summary: ReturnType<typeof buildProgressSummary>;
+    }> = [];
+
+    for (const user of targetUsers) {
+      const safeProgress = sanitizeProgress(user.progress ?? {});
+      safeProgress.admin.segment = segment;
+
+      const updatedUser = await prisma.user.update({
+        where: {
+          id: user.id
+        },
+        data: {
+          progress: toJsonValue(safeProgress)
+        }
+      });
+
+      updatedResults.push({
+        id: updatedUser.id,
+        telegramId: updatedUser.telegramId.toString(),
+        firstName: updatedUser.firstName,
+        username: updatedUser.username,
+        summary: buildProgressSummary(updatedUser.progress ?? {})
+      });
+    }
+
+    await appendAdminLog(
+      "segment_bulk_update",
+      "players",
+      applyToAll ? "all" : "selected",
+      applyToAll ? "Все игроки" : "Выбранные игроки",
+      {
+        segment,
+        affected: updatedResults.length,
+        userIds: updatedResults.map((user) => user.id)
+      }
+    );
+
+    res.json({
+      ok: true,
+      segment,
+      affected: updatedResults.length,
+      users: updatedResults
     });
   } catch (error) {
     next(error);
