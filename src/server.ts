@@ -34,6 +34,7 @@ type SystemStatusSettings = {
   title: string;
   message: string;
   targetSegments: string[];
+  bypassSegments: string[];
 };
 type SystemAnnouncementSettings = {
   enabled: boolean;
@@ -257,10 +258,22 @@ function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
   const rawTargetSegments = Array.isArray(safeValue.targetSegments)
     ? safeValue.targetSegments
     : [];
+  const rawBypassSegments = Array.isArray(safeValue.bypassSegments)
+    ? safeValue.bypassSegments
+    : [];
 
   const targetSegments = Array.from(
     new Set(
       rawTargetSegments
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim().slice(0, 40))
+        .filter(Boolean)
+    )
+  ).slice(0, 20);
+
+  const bypassSegments = Array.from(
+    new Set(
+      rawBypassSegments
         .filter((item): item is string => typeof item === "string")
         .map((item) => item.trim().slice(0, 40))
         .filter(Boolean)
@@ -276,7 +289,8 @@ function sanitizeSystemStatusSettings(value: unknown): SystemStatusSettings {
         "Сейчас в игре идут технические работы. Попробуй зайти немного позже."
       ).slice(0, 600) ||
       "Сейчас в игре идут технические работы. Попробуй зайти немного позже.",
-    targetSegments
+    targetSegments,
+    bypassSegments
   };
 }
 function sanitizeSystemAnnouncementSettings(value: unknown): SystemAnnouncementSettings {
@@ -318,6 +332,13 @@ function getPlayerSegmentFromProgress(progress: unknown) {
   return sanitizeProgress(progress).admin.segment;
 }
 
+function isMaintenanceBypassedForSegment(
+  systemStatus: SystemStatusSettings,
+  playerSegment: string
+) {
+  return !!playerSegment && systemStatus.bypassSegments.includes(playerSegment);
+}
+
 function isMaintenanceActiveForSegment(
   systemStatus: SystemStatusSettings,
   playerSegment: string
@@ -326,11 +347,15 @@ function isMaintenanceActiveForSegment(
     return false;
   }
 
+  if (isMaintenanceBypassedForSegment(systemStatus, playerSegment)) {
+    return false;
+  }
+
   if (systemStatus.targetSegments.length === 0) {
     return true;
   }
 
-  return systemStatus.targetSegments.includes(playerSegment);
+  return !!playerSegment && systemStatus.targetSegments.includes(playerSegment);
 }
 function sanitizeProgress(progress: unknown) {
   const root = isRecord(progress) ? progress : {};
@@ -816,7 +841,8 @@ async function getOrCreateSystemUser() {
           maintenanceEnabled: false,
           title: "Технические работы",
           message: "Сейчас в игре идут технические работы. Попробуй зайти немного позже.",
-          targetSegments: []
+          targetSegments: [],
+          bypassSegments: []
         }
       }
     }
@@ -1117,6 +1143,37 @@ app.get("/api/health", (_req, res) => {
     message: "Backend is running"
   });
 });
+
+app.get("/api/system/access", async (req, res) => {
+  try {
+    const initData = getInitDataFromRequest(req);
+    const dbUser = await findOrCreateTelegramUser(initData);
+    const system = await getSystemStatusSettings();
+    const announcement = await getSystemAnnouncementSettings();
+    const playerSegment = getPlayerSegmentFromProgress(dbUser.progress);
+    const banned = isBannedProgress(dbUser.progress);
+    const maintenance = isMaintenanceActiveForSegment(system, playerSegment);
+
+    res.json({
+      ok: true,
+      access: banned ? "banned" : maintenance ? "maintenance" : "allowed",
+      playerSegment,
+      system: {
+        ...system,
+        announcement
+      }
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Unauthorized request";
+
+    res.status(401).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
 app.get("/api/system/status", async (_req, res, next) => {
   try {
     const system = await getSystemStatusSettings();
@@ -1157,7 +1214,8 @@ app.post("/api/admin/system-status", requireAdminSecret, async (req, res, next) 
       maintenanceEnabled: req.body?.maintenanceEnabled ?? current.maintenanceEnabled,
       title: req.body?.title ?? current.title,
       message: req.body?.message ?? current.message,
-      targetSegments: req.body?.targetSegments ?? current.targetSegments
+      targetSegments: req.body?.targetSegments ?? current.targetSegments,
+      bypassSegments: req.body?.bypassSegments ?? current.bypassSegments
     });
 
     await setSystemStatusSettings(nextSystem);
@@ -1165,6 +1223,7 @@ app.post("/api/admin/system-status", requireAdminSecret, async (req, res, next) 
       maintenanceEnabled: nextSystem.maintenanceEnabled,
       title: nextSystem.title,
       targetSegments: nextSystem.targetSegments,
+      bypassSegments: nextSystem.bypassSegments,
       scope: nextSystem.targetSegments.length > 0 ? "segments" : "all"
     });
 
