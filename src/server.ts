@@ -419,7 +419,10 @@ function sanitizeProgress(progress: unknown) {
   return {
     player: {
       name: toSafeString(playerRaw.name, DEFAULT_PLAYER_NAME),
-      coins: toSafeNumber(playerRaw.coins, DEFAULT_PLAYER_COINS, 0, 999999)
+      coins: toSafeNumber(playerRaw.coins, DEFAULT_PLAYER_COINS, 0, 999999),
+      level: toSafeNumber(playerRaw.level, 1, 1, 99),
+      xp: toSafeNumber(playerRaw.xp, 0, 0, 999999),
+      xpToNext: toSafeNumber(playerRaw.xpToNext, 100, 20, 999999)
     },
     world: {
       weather: isWeather(worldRaw.weather) ? worldRaw.weather : "Солнце",
@@ -535,6 +538,9 @@ function buildProgressSummary(progress: unknown) {
   const safe = sanitizeProgress(progress);
   const baseSummary = {
     coins: safe.player.coins,
+    playerLevel: safe.player.level,
+    playerXp: safe.player.xp,
+    playerXpToNext: safe.player.xpToNext,
     tasksDone: safe.tasks.filter((task) => task.done).length,
     tasksClaimed: safe.tasks.filter((task) => task.claimed).length,
     tasksTotal: safe.tasks.length,
@@ -559,7 +565,7 @@ function buildProgressSummary(progress: unknown) {
     banned: safe.admin.banned,
     segment: safe.admin.segment
   };
-  const level = getLevelFromSummary(baseSummary);
+  const level = safe.player.level;
   const progressPercent = baseSummary.tasksTotal
     ? clampInteger(
         Math.round((baseSummary.tasksDone / baseSummary.tasksTotal) * 100),
